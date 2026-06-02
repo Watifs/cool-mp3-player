@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local user data (machine-specific paths / personal library)
+player_library.json
+player_playlists.json
+player_lyrics.json
