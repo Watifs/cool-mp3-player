@@ -359,29 +359,36 @@ class AudioSpectrum:
     def __init__(self):
         self._lock   = threading.Lock()
         self._samples = None     # mono float32, peak-normalised
+        self._samples_lr = None  # stereo float32 (N,2), same normalisation
         self._token   = 0        # guards against a stale background load
 
     def load(self, path: str):
-        """Kick off a background decode of `path` into a mono sample buffer."""
+        """Kick off a background decode of `path` into mono + stereo buffers."""
         if not _PYGAME:
             return
         self._token += 1
         token = self._token
         with self._lock:
             self._samples = None
+            self._samples_lr = None
 
         def _work():
             try:
                 snd = pygame.mixer.Sound(path)
-                arr = pygame.sndarray.array(snd)          # int16, (N,) or (N,2)
-                if arr.ndim == 2:
-                    arr = arr.mean(axis=1)
-                arr = arr.astype(np.float32)
-                peak = float(np.max(np.abs(arr))) or 1.0
-                arr /= peak
+                raw = pygame.sndarray.array(snd)          # int16, (N,) or (N,2)
+                if raw.ndim == 2:
+                    lr   = raw.astype(np.float32)
+                    mono = lr.mean(axis=1)
+                else:
+                    mono = raw.astype(np.float32)
+                    lr   = np.stack([mono, mono], axis=1)
+                peak = float(np.max(np.abs(mono))) or 1.0
+                mono = mono / peak
+                lr   = lr / peak
                 if token == self._token:                  # still the current song?
                     with self._lock:
-                        self._samples = arr
+                        self._samples    = mono
+                        self._samples_lr = lr
             except Exception:
                 pass
 
@@ -391,6 +398,40 @@ class AudioSpectrum:
         self._token += 1
         with self._lock:
             self._samples = None
+            self._samples_lr = None
+
+    def energy(self, t_sec: float, window: int = 2048) -> float:
+        """RMS loudness (0..~1) of the mono signal around `t_sec`."""
+        with self._lock:
+            s = self._samples
+        if s is None or len(s) == 0:
+            return 0.0
+        center = int(t_sec * MIXER_SR)
+        start  = max(0, center - window // 2)
+        end    = min(len(s), start + window)
+        chunk  = s[start:end]
+        if len(chunk) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+
+    def stereo(self, t_sec: float, n: int = 256, span: int = 2048):
+        """Return (left, right) sample arrays of length `n` around `t_sec`,
+        for a stereo meter / goniometer, or None if not ready."""
+        with self._lock:
+            lr = self._samples_lr
+        if lr is None or len(lr) == 0:
+            return None
+        center = int(t_sec * MIXER_SR)
+        start  = max(0, center - span // 2)
+        end    = start + span
+        if end > len(lr):
+            end = len(lr); start = max(0, end - span)
+        chunk = lr[start:end]
+        if len(chunk) < span:
+            chunk = np.pad(chunk, ((0, span - len(chunk)), (0, 0)))
+        idx = np.linspace(0, len(chunk) - 1, n).astype(int)
+        sub = chunk[idx]
+        return sub[:, 0], sub[:, 1]
 
     def bands(self, t_sec: float, n_bands: int = 64, window: int = 2048):
         """Return an array of `n_bands` magnitudes (0..~1) for the audio around
@@ -481,8 +522,10 @@ class NowPlayingOverlay(Frame):
         self._vis_built = False
         self._vis_geom  = {}          # cached geometry for the active style
         self._vis_wave  = None        # canvas line id for waveform styles
-        self._vis_modes = ["Bars", "Mirror", "Wave", "Radial", "Party"]
+        self._vis_modes = ["Bars", "Mirror", "Wave", "Radial",
+                           "Stereo", "Particles", "Geometry"]
         self._vis_mode  = 0
+        self._vis_hotspots = []       # on-canvas (x0,y0,x1,y1,action) controls
         # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars
         self._vis_themes = [
             {"name": "Aqua",    "lo": ACCENT_DK, "hi": ACCENT_HI},
@@ -493,13 +536,10 @@ class NowPlayingOverlay(Frame):
             {"name": "Rainbow", "lo": "#ff0040", "hi": "#40ffd0", "rainbow": True},
         ]
         self._vis_theme = 0
-        # Party-mode particle state
-        self._party_stars  = []
-        self._party_avg    = 0.0
-        self._party_flash  = 0.0
-        self._PARTY_GLYPHS = ["★", "✦", "✶", "✷", "❉", "✺", "✹", "♪", "✨"]
-        self._PARTY_COLORS = ["#ff3b6b", "#ffd23f", "#3ad6ff", "#7b5cff",
-                              "#5cff8f", "#ff8f3a", "#ff5cf0", "#ffffff"]
+        # Particles / Geometry / beat state
+        self._particles = []          # list of particle dicts (oval ids + motion)
+        self._geom_rot  = 0.0         # running rotation for Geometry
+        self._beat_avg  = 0.0         # smoothed RMS for beat detection
         self._build_ui()
 
     # ── Slide animation ─────────────────────────────────────────────────────
@@ -960,8 +1000,9 @@ class NowPlayingOverlay(Frame):
         if self._vis_cv is None:
             self._vis_cv = Canvas(self, bg="#050505", highlightthickness=0,
                                   cursor="hand2")
-            # Left-click closes the visualizer; right-click cycles its style.
-            self._vis_cv.bind("<Button-1>", lambda _e: self._toggle_visualizer())
+            # Click routes through on-canvas controls (Style / Color / Close);
+            # a click anywhere else closes. Right-click also cycles the style.
+            self._vis_cv.bind("<Button-1>", self._vis_click)
             self._vis_cv.bind("<Button-3>", lambda _e: self._cycle_vis_mode())
             self._vis_cv.bind("<Configure>", lambda _e: self._vis_build())
         self._vis_levels = np.zeros(self._vis_n, dtype=np.float32)
@@ -1009,7 +1050,7 @@ class NowPlayingOverlay(Frame):
         if not self._vis_cv: return
         cv = self._vis_cv
         cv.delete("all")
-        try: cv.config(bg="#050505")   # Party mode flashes this; always reset first
+        try: cv.config(bg="#050505")   # reset (some modes may tint the background)
         except Exception: pass
         w = cv.winfo_width(); h = cv.winfo_height()
         if w <= 1 or h <= 1: return
@@ -1049,20 +1090,81 @@ class NowPlayingOverlay(Frame):
                     cv.create_line(cx, cy, cx, cy, fill=ACCENT, width=3,
                                    capstyle=ROUND))
 
-        elif mode == "Party":
-            # Particle-driven — stars are spawned per beat in _vis_render_party.
-            self._party_stars = []
-            self._party_avg   = 0.0
-            self._party_flash = 0.0
+        elif mode == "Stereo":
+            cx = w * 0.5; cy = h * 0.55
+            R  = min(w, h) * 0.26
+            self._vis_geom.update(cx=cx, cy=cy, R=R, meter_w=max(24, w * 0.05))
+            # Goniometer / vectorscope: a single traced line of L/R points.
+            m = 256
+            self._vis_wave = cv.create_line(cx, cy, cx, cy, fill=theme["hi"],
+                                            width=1, smooth=True)
+            # Left + right level meters (track + fill rectangles).
+            mw = self._vis_geom["meter_w"]
+            self._vis_geom["lm_x"] = 0.06 * w
+            self._vis_geom["rm_x"] = 0.94 * w - mw
+            for key in ("lm", "rm"):
+                bx = self._vis_geom[key + "_x"]
+                cv.create_rectangle(bx, h * 0.18, bx + mw, h * 0.86,
+                                    outline=BORDER, width=1)
+                self._vis_geom[key] = cv.create_rectangle(
+                    bx, h * 0.86, bx + mw, h * 0.86, fill=theme["hi"], width=0)
+            cv.create_text(self._vis_geom["lm_x"] + mw / 2, h * 0.90, text="L",
+                           fill=TXT_MID, font=(FF, 11, "bold"))
+            cv.create_text(self._vis_geom["rm_x"] + mw / 2, h * 0.90, text="R",
+                           fill=TXT_MID, font=(FF, 11, "bold"))
+
+        elif mode == "Particles":
+            self._particles = []
+            cnt = 130
+            for i in range(cnt):
+                x = random.uniform(0, w); y = random.uniform(0, h)
+                ang = random.uniform(0, 2 * np.pi)
+                spd = random.uniform(0.2, 1.0)
+                self._particles.append({
+                    "id": cv.create_oval(x, y, x, y, fill=ACCENT, width=0),
+                    "x": x, "y": y,
+                    "vx": np.cos(ang) * spd, "vy": np.sin(ang) * spd,
+                    "base": random.uniform(1.5, 4.0),
+                    "hue": i / cnt, "cur_r": -1})
+            self._beat_avg = 0.0
+
+        elif mode == "Geometry":
+            cx, cy = w * 0.5, h * 0.54
+            self._vis_geom.update(cx=cx, cy=cy, R=min(w, h) * 0.18)
+            # Two counter-rotating closed polygons (outer reacts, inner accents).
+            self._vis_items = [
+                cv.create_line(cx, cy, cx, cy, fill=theme["hi"], width=3,
+                               smooth=True, joinstyle=ROUND),
+                cv.create_line(cx, cy, cx, cy, fill=theme["lo"], width=2,
+                               smooth=True, joinstyle=ROUND)]
+            self._geom_rot = 0.0
 
         # Header text over the visualizer
         self._vis_title = cv.create_text(
             w // 2, int(h * 0.09), text="", fill=TXT, font=(FF, 16, "bold"))
-        cv.create_text(
-            w // 2, int(h * 0.09) + 26,
-            text=f"{mode}   ·   left-click to close   ·   right-click to change style",
-            fill=TXT_DIM, font=(FF, 9))
+        # On-canvas controls (clickable while the visualizer is showing)
+        self._vis_hotspots = []
+        chips = [("◑  " + mode,                              "style"),
+                 ("🎨  " + self._vis_themes[self._vis_theme]["name"], "theme"),
+                 ("✕  Close",                                "close")]
+        cxp = int(w * 0.5) - 200
+        for label, action in chips:
+            cxp = self._vis_chip(cv, cxp, int(h * 0.09) + 30, label, action) + 10
         self._vis_built = True
+
+    def _vis_chip(self, cv, x, y, label, action):
+        """Draw a small clickable control chip; record its hotspot. Returns the
+        right edge x so chips can be laid out left-to-right."""
+        pad = 11
+        tid = cv.create_text(x + pad, y, text=label, anchor=W,
+                             fill=TXT_MID, font=(FF, 10, "bold"))
+        bx0, by0, bx1, by1 = cv.bbox(tid)
+        rx0, ry0, rx1, ry1 = x, by0 - 6, bx1 + pad, by1 + 6
+        rect = cv.create_rectangle(rx0, ry0, rx1, ry1, fill=BG3,
+                                   outline=BORDER, width=1)
+        cv.tag_lower(rect, tid)
+        self._vis_hotspots.append((rx0, ry0, rx1, ry1, action))
+        return rx1
 
     # ── Visualizer: per-frame render ─────────────────────────────────────────────
     def _vis_tick(self):
@@ -1090,8 +1192,8 @@ class NowPlayingOverlay(Frame):
         if mode == "Wave":
             wav = app._spectrum.wave(t, self._wave_n) if t is not None else None
             self._vis_render_wave(cv, w, h, wav)
-        elif mode == "Party":
-            self._vis_render_party(cv, w, h, t)
+        elif mode == "Stereo":
+            self._vis_render_stereo(cv, w, h, t)
         else:
             bands = app._spectrum.bands(t, n_bands=self._vis_n) if t is not None else None
             lv = self._vis_levels
@@ -1104,9 +1206,11 @@ class NowPlayingOverlay(Frame):
                         lv[i] = lv[i] + (target - lv[i]) * 0.6   # fast attack
                     else:
                         lv[i] = lv[i] * 0.82 + target * 0.18     # slow release
-            if   mode == "Bars":   self._vis_render_bars(cv, w, h, lv)
-            elif mode == "Mirror": self._vis_render_mirror(cv, w, h, lv)
-            elif mode == "Radial": self._vis_render_radial(cv, w, h, lv)
+            if   mode == "Bars":      self._vis_render_bars(cv, w, h, lv)
+            elif mode == "Mirror":    self._vis_render_mirror(cv, w, h, lv)
+            elif mode == "Radial":    self._vis_render_radial(cv, w, h, lv)
+            elif mode == "Particles": self._vis_render_particles(cv, w, h, lv, t)
+            elif mode == "Geometry":  self._vis_render_geometry(cv, w, h, lv, t)
 
         self._vis_anim_id = app.root.after(33, self._vis_tick)   # ~30 fps
 
@@ -1159,74 +1263,106 @@ class NowPlayingOverlay(Frame):
                 pts += [i * dx, cy - float(wav[i]) * amp]
         cv.coords(self._vis_wave, *pts)
 
-    # ── Party: beat-reactive popping/flashing stars ──────────────────────────────
-    def _party_spawn(self, cv, w, h, energy):
-        glyph = random.choice(self._PARTY_GLYPHS)
-        color = random.choice(self._PARTY_COLORS)
-        x = random.uniform(w * 0.06, w * 0.94)
-        y = random.uniform(h * 0.16, h * 0.92)
-        size  = random.randint(18, 30 + int(34 * min(1.0, energy)))
-        flash = random.random() < 0.35          # ~a third just blink instead of fading
-        life  = random.randint(40, 85) if flash else random.randint(18, 42)
-        sid = cv.create_text(x, y, text=glyph, fill=color,
-                             font=(FF, max(1, int(size * 0.25))))
-        self._party_stars.append({
-            "id": sid, "x": x, "y": y,
-            "vx": random.uniform(-0.6, 0.6), "vy": random.uniform(-1.3, -0.2),
-            "size": size, "color": color, "flash": flash,
-            "age": 0, "life": life, "cur_sz": None})
+    # ── On-canvas control clicks ─────────────────────────────────────────────────
+    def _vis_click(self, event):
+        for x0, y0, x1, y1, action in self._vis_hotspots:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                if   action == "style": self._cycle_vis_mode()
+                elif action == "theme": self._cycle_vis_theme()
+                else:                   self._toggle_visualizer()
+                return
+        self._toggle_visualizer()          # click anywhere else closes
 
-    def _vis_render_party(self, cv, w, h, t):
-        # ---- loudness (waveform RMS) + adaptive beat detection ----
-        wav = self.app._spectrum.wave(t, 1024) if t is not None else None
-        if wav is None:
-            energy = 0.0
+    def _beat(self, t):
+        """Adaptive beat flag + RMS energy at position `t` (shared by modes)."""
+        energy = self.app._spectrum.energy(t) if t is not None else 0.0
+        avg    = self._beat_avg
+        beat   = (energy > avg * 1.3 and energy > avg + 0.012 and energy > 0.02)
+        self._beat_avg = avg * 0.90 + energy * 0.10
+        return beat, energy
+
+    # ── Stereo meter + goniometer ────────────────────────────────────────────────
+    def _vis_render_stereo(self, cv, w, h, t):
+        g = self._vis_geom
+        st = self.app._spectrum.stereo(t, 256) if t is not None else None
+        theme = self._vis_themes[self._vis_theme]
+        cx, cy, R = g["cx"], g["cy"], g["R"]
+        if st is None:
+            cv.coords(self._vis_wave, cx, cy, cx, cy)
+            L = Rr = 0.0
         else:
-            energy = float(np.sqrt(np.mean(wav.astype(np.float64) ** 2)))
-        avg = self._party_avg
-        beat = (wav is not None and energy > avg * 1.3
-                and energy > avg + 0.012 and energy > 0.02)
-        self._party_avg = avg * 0.90 + energy * 0.10
+            left, right = st
+            # Goniometer: rotate (L,R) 45° → x=(L-R), y=(L+R); classic vectorscope.
+            gx = cx + (left - right) * (R * 0.7071)
+            gy = cy - (left + right) * (R * 0.7071)
+            pts = []
+            for i in range(len(left)):
+                pts += [float(gx[i]), float(gy[i])]
+            cv.coords(self._vis_wave, *pts)
+            L  = float(np.sqrt(np.mean(left.astype(np.float64) ** 2)))
+            Rr = float(np.sqrt(np.mean(right.astype(np.float64) ** 2)))
+        # Level meters (clamp RMS into a readable range).
+        top = h * 0.18; bot = h * 0.86; span = bot - top
+        for key, val in (("lm", L), ("rm", Rr)):
+            lvl = max(0.0, min(1.0, val * 3.2))
+            bx0 = g[key + "_x"]; bx1 = bx0 + g["meter_w"]
+            cv.coords(g[key], bx0, bot - lvl * span, bx1, bot)
+            cv.itemconfig(g[key], fill=_lerp_color(theme["lo"], theme["hi"], lvl))
 
-        # ---- full-canvas flash on strong beats ----
-        self._party_flash = max(0.0, self._party_flash - 0.12)
-        if beat:
-            self._party_flash = min(1.0, self._party_flash + 0.55)
-        bg = _lerp_color("#050505", "#23233a", self._party_flash * 0.8)
-        try: cv.config(bg=bg)
-        except Exception: pass
+    # ── Audio-reactive particle field ────────────────────────────────────────────
+    def _vis_render_particles(self, cv, w, h, lv, t):
+        beat, energy = self._beat(t)
+        cx, cy = w * 0.5, h * 0.5
+        drive  = 1.0 + energy * 4.0                  # global motion speeds up
+        theme  = self._vis_themes[self._vis_theme]
+        for p in self._particles:
+            if beat:                                  # outward impulse on a beat
+                dx = p["x"] - cx; dy = p["y"] - cy
+                d  = (dx * dx + dy * dy) ** 0.5 or 1.0
+                kick = 2.5 + energy * 5.0
+                p["vx"] += dx / d * kick; p["vy"] += dy / d * kick
+            p["x"] += p["vx"] * drive; p["y"] += p["vy"] * drive
+            p["vx"] *= 0.96; p["vy"] *= 0.96          # drag
+            # wrap around screen edges
+            if p["x"] < -10: p["x"] = w + 10
+            if p["x"] > w + 10: p["x"] = -10
+            if p["y"] < -10: p["y"] = h + 10
+            if p["y"] > h + 10: p["y"] = -10
+            level = max(0.0, min(1.0, energy * 2.2))
+            r = max(1, int(p["base"] * (0.7 + energy * 3.5)))
+            x, y = p["x"], p["y"]
+            cv.coords(p["id"], x - r, y - r, x + r, y + r)
+            if r != p["cur_r"]:
+                p["cur_r"] = r
+            col = (_hsv_hex(p["hue"] + level * 0.1, 0.8, 0.4 + 0.6 * level)
+                   if theme.get("rainbow")
+                   else _lerp_color(theme["lo"], theme["hi"], level))
+            cv.itemconfig(p["id"], fill=col)
 
-        # ---- spawn a burst of stars on the beat ----
-        if beat and len(self._party_stars) < 70:
-            for _ in range(3 + int(energy * 12)):
-                self._party_spawn(cv, w, h, energy)
-
-        # ---- advance + draw existing stars ----
-        dead = []
-        for st in self._party_stars:
-            st["age"] += 1
-            frac = st["age"] / st["life"]
-            if frac >= 1.0:
-                dead.append(st); continue
-            scale = 0.25 + 0.75 * (st["age"] / 6) if st["age"] < 6 else 1.0
-            st["x"] += st["vx"]; st["y"] += st["vy"]; st["vy"] += 0.04
-            if st["flash"]:                                   # blink bright/dim
-                b = 0.5 + 0.5 * float(np.sin(st["age"] * 0.6))
-                col = _lerp_color("#101010", st["color"], b)
-                sz  = int(st["size"] * scale)
-            else:                                             # pop then fade out
-                col = _lerp_color(st["color"], bg, frac)
-                sz  = int(st["size"] * scale * (1.0 - 0.3 * frac))
-            sz = max(1, sz)
-            cv.coords(st["id"], st["x"], st["y"])
-            if sz != st["cur_sz"]:
-                cv.itemconfig(st["id"], fill=col, font=(FF, sz)); st["cur_sz"] = sz
-            else:
-                cv.itemconfig(st["id"], fill=col)
-        for st in dead:
-            try: cv.delete(st["id"])
-            except Exception: pass
-            self._party_stars.remove(st)
+    # ── Audio-reactive rotating geometry ─────────────────────────────────────────
+    def _vis_render_geometry(self, cv, w, h, lv, t):
+        g = self._vis_geom
+        cx, cy, R = g["cx"], g["cy"], g["R"]
+        _beat, energy = self._beat(t)
+        self._geom_rot += 0.012 + energy * 0.06       # spin faster when louder
+        n = self._vis_n
+        Rscale = min(w, h) * 0.26
+        outer, inner = self._vis_items
+        op = []; ip = []
+        for i in range(n):
+            level = max(0.0, min(1.0, float(lv[i])))
+            a_o = self._geom_rot + (i / n) * 2 * np.pi
+            ro  = R + level * Rscale
+            op += [cx + ro * np.cos(a_o), cy + ro * np.sin(a_o)]
+            a_i = -self._geom_rot * 1.4 + (i / n) * 2 * np.pi
+            ri  = R * 0.55 + level * Rscale * 0.5
+            ip += [cx + ri * np.cos(a_i), cy + ri * np.sin(a_i)]
+        op += op[:2]; ip += ip[:2]                    # close the loops
+        cv.coords(outer, *op)
+        cv.coords(inner, *ip)
+        peak = max(0.0, min(1.0, energy * 2.2))
+        cv.itemconfig(outer, fill=self._vis_color(peak, n // 2))
+        cv.itemconfig(inner, fill=self._vis_color(0.4 + 0.6 * peak, n // 4))
 
     # ── Update tick ──────────────────────────────────────────────────────────────
     def _tick(self):
