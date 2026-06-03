@@ -19,7 +19,7 @@ Install:
 (librosa is NOT required — this build does no acoustic analysis.)
 """
 
-import os, re, io, json, time, uuid, queue, ctypes, random, threading, datetime
+import os, re, io, json, time, uuid, queue, ctypes, random, colorsys, threading, datetime
 import urllib.request, urllib.parse
 from pathlib import Path
 from tkinter import *
@@ -422,6 +422,24 @@ class AudioSpectrum:
         m   = float(out.max()) or 1.0
         return out / m
 
+    def wave(self, t_sec: float, n: int = 512, span: int = 4096):
+        """Return `n` time-domain samples (≈ -1..1) around position `t_sec`,
+        for an oscilloscope-style visualizer, or None if not ready."""
+        with self._lock:
+            s = self._samples
+        if s is None or len(s) == 0:
+            return None
+        center = int(t_sec * MIXER_SR)
+        start  = max(0, center - span // 2)
+        end    = start + span
+        if end > len(s):
+            end = len(s); start = max(0, end - span)
+        chunk = s[start:end]
+        if len(chunk) < span:
+            chunk = np.pad(chunk, (0, span - len(chunk)))
+        idx = np.linspace(0, len(chunk) - 1, n).astype(int)
+        return chunk[idx]
+
 
 def _lerp_color(c1: str, c2: str, t: float) -> str:
     t = max(0.0, min(1.0, t))
@@ -430,6 +448,13 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
     return (f"#{int(r1+(r2-r1)*t):02x}"
             f"{int(g1+(g2-g1)*t):02x}"
             f"{int(b1+(b2-b1)*t):02x}")
+
+
+def _hsv_hex(h: float, s: float, v: float) -> str:
+    """HSV (0..1) → #rrggbb hex string."""
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, max(0.0, min(1.0, s)),
+                                  max(0.0, min(1.0, v)))
+    return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
 
 # ==============================================================================
@@ -448,10 +473,33 @@ class NowPlayingOverlay(Frame):
         # Visualizer state
         self._vis_on    = False
         self._vis_cv    = None
-        self._vis_bars  = []
+        self._vis_items = []          # per-bar/line canvas ids for the active style
         self._vis_levels = None
         self._vis_anim_id = None
         self._vis_n     = 64
+        self._wave_n    = 256         # points sampled for the waveform styles
+        self._vis_built = False
+        self._vis_geom  = {}          # cached geometry for the active style
+        self._vis_wave  = None        # canvas line id for waveform styles
+        self._vis_modes = ["Bars", "Mirror", "Wave", "Radial", "Party"]
+        self._vis_mode  = 0
+        # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars
+        self._vis_themes = [
+            {"name": "Aqua",    "lo": ACCENT_DK, "hi": ACCENT_HI},
+            {"name": "Fire",    "lo": "#5a1200", "hi": "#ffd54a"},
+            {"name": "Neon",    "lo": "#3a0ca3", "hi": "#f72585"},
+            {"name": "Ice",     "lo": "#0a2a5e", "hi": "#9be3ff"},
+            {"name": "Sunset",  "lo": "#42126b", "hi": "#ff9e3d"},
+            {"name": "Rainbow", "lo": "#ff0040", "hi": "#40ffd0", "rainbow": True},
+        ]
+        self._vis_theme = 0
+        # Party-mode particle state
+        self._party_stars  = []
+        self._party_avg    = 0.0
+        self._party_flash  = 0.0
+        self._PARTY_GLYPHS = ["★", "✦", "✶", "✷", "❉", "✺", "✹", "♪", "✨"]
+        self._PARTY_COLORS = ["#ff3b6b", "#ffd23f", "#3ad6ff", "#7b5cff",
+                              "#5cff8f", "#ff8f3a", "#ff5cf0", "#ffffff"]
         self._build_ui()
 
     # ── Slide animation ─────────────────────────────────────────────────────
@@ -509,6 +557,20 @@ class NowPlayingOverlay(Frame):
                                activeforeground=WHITE,
                                command=self._toggle_visualizer)
         self._vis_btn.pack(side=RIGHT)
+        # Cycle between visualizer styles (Bars / Mirror / Wave / Radial)
+        self._vis_style_btn = Button(hdr, text="◑  " + self._vis_modes[self._vis_mode],
+                               font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID, relief=FLAT,
+                               cursor="hand2", padx=12, pady=4,
+                               activebackground=BG3, activeforeground=ACCENT,
+                               command=self._cycle_vis_mode)
+        self._vis_style_btn.pack(side=RIGHT, padx=(0, 8))
+        # Cycle color themes (Aqua / Fire / Neon / Ice / Sunset / Rainbow)
+        self._vis_theme_btn = Button(hdr, text="🎨  " + self._vis_themes[self._vis_theme]["name"],
+                               font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID, relief=FLAT,
+                               cursor="hand2", padx=12, pady=4,
+                               activebackground=BG3, activeforeground=ACCENT,
+                               command=self._cycle_vis_theme)
+        self._vis_theme_btn.pack(side=RIGHT, padx=(0, 8))
         tip = Label(hdr, text="click title to close", font=(FF, 8),
                     bg="#0a0a0a", fg=TXT_DIM)
         tip.pack(side=RIGHT, padx=10)
@@ -898,48 +960,118 @@ class NowPlayingOverlay(Frame):
         if self._vis_cv is None:
             self._vis_cv = Canvas(self, bg="#050505", highlightthickness=0,
                                   cursor="hand2")
-            # Clicking the visualizer surface closes it too.
+            # Left-click closes the visualizer; right-click cycles its style.
             self._vis_cv.bind("<Button-1>", lambda _e: self._toggle_visualizer())
-            self._vis_cv.bind("<Configure>", lambda _e: self._vis_build_bars())
+            self._vis_cv.bind("<Button-3>", lambda _e: self._cycle_vis_mode())
+            self._vis_cv.bind("<Configure>", lambda _e: self._vis_build())
         self._vis_levels = np.zeros(self._vis_n, dtype=np.float32)
         self._vis_cv.place(x=0, y=0, relwidth=1.0, relheight=1.0)
         # NOTE: Canvas.lift / Canvas.tkraise are aliased to the canvas *item*
         # raise command, so calling them bare raises a TclError. Use the base
         # Misc.tkraise to raise the whole canvas widget in the stacking order.
         Misc.tkraise(self._vis_cv)
-        self._vis_build_bars()
+        self._vis_build()
         self._vis_tick()
 
-    def _vis_build_bars(self):
+    def _cycle_vis_mode(self):
+        """Advance to the next visualizer style and rebuild the canvas."""
+        self._vis_mode = (self._vis_mode + 1) % len(self._vis_modes)
+        mode = self._vis_modes[self._vis_mode]
+        try: self._vis_style_btn.config(text="◑  " + mode)
+        except Exception: pass
+        if self._vis_levels is not None:
+            self._vis_levels[:] = 0.0
+        if self._vis_on:
+            self._vis_build()
+        self.app._status.set(f"Visualizer style: {mode}")
+
+    def _cycle_vis_theme(self):
+        """Advance to the next color theme and recolor the visualizer."""
+        self._vis_theme = (self._vis_theme + 1) % len(self._vis_themes)
+        name = self._vis_themes[self._vis_theme]["name"]
+        try: self._vis_theme_btn.config(text="🎨  " + name)
+        except Exception: pass
+        if self._vis_on:
+            self._vis_build()      # rebuild so the waveform line picks up the new color
+        self.app._status.set(f"Visualizer theme: {name}")
+
+    def _vis_color(self, level: float, i: int) -> str:
+        """Color for bar/line `i` at intensity `level`, per the active theme."""
+        theme = self._vis_themes[self._vis_theme]
+        if theme.get("rainbow"):
+            hue = (i / max(1, self._vis_n) + level * 0.08) % 1.0
+            return _hsv_hex(hue, 0.85, 0.35 + 0.65 * level)
+        return _lerp_color(theme["lo"], theme["hi"], level)
+
+    # ── Visualizer: build the canvas items for the active style ──────────────────
+    def _vis_build(self):
+        self._vis_built = False
         if not self._vis_cv: return
         cv = self._vis_cv
         cv.delete("all")
+        try: cv.config(bg="#050505")   # Party mode flashes this; always reset first
+        except Exception: pass
         w = cv.winfo_width(); h = cv.winfo_height()
         if w <= 1 or h <= 1: return
+        mode = self._vis_modes[self._vis_mode]
+        theme = self._vis_themes[self._vis_theme]
         n = self._vis_n
-        gap = 3
-        bw = (w - gap * (n + 1)) / n
-        self._vis_bars = []
-        base_y = int(h * 0.86)
-        for i in range(n):
-            x0 = gap + i * (bw + gap)
-            x1 = x0 + bw
-            rect = cv.create_rectangle(x0, base_y, x1, base_y, fill=ACCENT, width=0)
-            self._vis_bars.append(rect)
+        self._vis_items = []
+        self._vis_wave  = None
+        self._vis_geom  = {"w": w, "h": h}
+
+        if mode in ("Bars", "Mirror"):
+            gap = 3
+            bw = (w - gap * (n + 1)) / n
+            base_y = int(h * 0.86) if mode == "Bars" else int(h * 0.5)
+            self._vis_geom.update(gap=gap, bw=bw, base_y=base_y)
+            for i in range(n):
+                x0 = gap + i * (bw + gap); x1 = x0 + bw
+                self._vis_items.append(
+                    cv.create_rectangle(x0, base_y, x1, base_y, fill=ACCENT, width=0))
+
+        elif mode == "Wave":
+            m  = self._wave_n
+            cy = h * 0.5
+            pts = []
+            for i in range(m):
+                pts += [i * (w / (m - 1)), cy]
+            self._vis_wave = cv.create_line(*pts, fill=theme["hi"], width=2, smooth=True)
+
+        elif mode == "Radial":
+            cx, cy = w * 0.5, h * 0.52
+            R = min(w, h) * 0.16
+            ang = np.linspace(0, 2 * np.pi, n, endpoint=False) - np.pi / 2
+            self._vis_geom.update(cx=cx, cy=cy, R=R,
+                                  cos=np.cos(ang), sin=np.sin(ang))
+            for i in range(n):
+                self._vis_items.append(
+                    cv.create_line(cx, cy, cx, cy, fill=ACCENT, width=3,
+                                   capstyle=ROUND))
+
+        elif mode == "Party":
+            # Particle-driven — stars are spawned per beat in _vis_render_party.
+            self._party_stars = []
+            self._party_avg   = 0.0
+            self._party_flash = 0.0
+
         # Header text over the visualizer
         self._vis_title = cv.create_text(
-            w // 2, int(h * 0.10), text="", fill=TXT,
-            font=(FF, 16, "bold"))
-        cv.create_text(w // 2, int(h * 0.10) + 26,
-                       text="click anywhere to close", fill=TXT_DIM, font=(FF, 9))
+            w // 2, int(h * 0.09), text="", fill=TXT, font=(FF, 16, "bold"))
+        cv.create_text(
+            w // 2, int(h * 0.09) + 26,
+            text=f"{mode}   ·   left-click to close   ·   right-click to change style",
+            fill=TXT_DIM, font=(FF, 9))
+        self._vis_built = True
 
+    # ── Visualizer: per-frame render ─────────────────────────────────────────────
     def _vis_tick(self):
         if not self._vis_on or not self._vis_cv:
             return
         app = self.app
         cv  = self._vis_cv
         w = cv.winfo_width(); h = cv.winfo_height()
-        if w <= 1 or h <= 1 or not self._vis_bars:
+        if w <= 1 or h <= 1 or not self._vis_built:
             self._vis_anim_id = app.root.after(40, self._vis_tick)
             return
 
@@ -950,36 +1082,151 @@ class NowPlayingOverlay(Frame):
         except Exception:
             pass
 
-        n = self._vis_n
-        bands = None
+        t = None
         if app._playing and app._song_dur > 0:
             t = min(time.time() - app._play_start, app._song_dur)
-            bands = app._spectrum.bands(t, n_bands=n)
+        mode = self._vis_modes[self._vis_mode]
 
-        lv = self._vis_levels
-        if bands is None:
-            lv *= 0.85                       # decay to rest when idle / not ready
+        if mode == "Wave":
+            wav = app._spectrum.wave(t, self._wave_n) if t is not None else None
+            self._vis_render_wave(cv, w, h, wav)
+        elif mode == "Party":
+            self._vis_render_party(cv, w, h, t)
         else:
-            for i in range(n):
-                target = float(bands[i])
-                if target > lv[i]:
-                    lv[i] = lv[i] + (target - lv[i]) * 0.6   # fast attack
-                else:
-                    lv[i] = lv[i] * 0.82 + target * 0.18     # slow release
-
-        base_y  = int(h * 0.86)
-        max_bar = int(h * 0.66)
-        gap = 3
-        bw = (w - gap * (n + 1)) / n
-        for i, rect in enumerate(self._vis_bars):
-            level = max(0.0, min(1.0, float(lv[i])))
-            bh = int(level * max_bar) + 2
-            x0 = gap + i * (bw + gap)
-            x1 = x0 + bw
-            cv.coords(rect, x0, base_y - bh, x1, base_y)
-            cv.itemconfig(rect, fill=_lerp_color(ACCENT_DK, ACCENT_HI, level))
+            bands = app._spectrum.bands(t, n_bands=self._vis_n) if t is not None else None
+            lv = self._vis_levels
+            if bands is None:
+                lv *= 0.85                       # decay to rest when idle / not ready
+            else:
+                for i in range(self._vis_n):
+                    target = float(bands[i])
+                    if target > lv[i]:
+                        lv[i] = lv[i] + (target - lv[i]) * 0.6   # fast attack
+                    else:
+                        lv[i] = lv[i] * 0.82 + target * 0.18     # slow release
+            if   mode == "Bars":   self._vis_render_bars(cv, w, h, lv)
+            elif mode == "Mirror": self._vis_render_mirror(cv, w, h, lv)
+            elif mode == "Radial": self._vis_render_radial(cv, w, h, lv)
 
         self._vis_anim_id = app.root.after(33, self._vis_tick)   # ~30 fps
+
+    def _vis_render_bars(self, cv, w, h, lv):
+        g = self._vis_geom
+        gap = g["gap"]; bw = g["bw"]; base_y = g["base_y"]
+        max_bar = int(h * 0.66)
+        for i, rect in enumerate(self._vis_items):
+            level = max(0.0, min(1.0, float(lv[i])))
+            bh = int(level * max_bar) + 2
+            x0 = gap + i * (bw + gap); x1 = x0 + bw
+            cv.coords(rect, x0, base_y - bh, x1, base_y)
+            cv.itemconfig(rect, fill=self._vis_color(level, i))
+
+    def _vis_render_mirror(self, cv, w, h, lv):
+        g = self._vis_geom
+        gap = g["gap"]; bw = g["bw"]; cy = g["base_y"]
+        max_bar = int(h * 0.40)
+        for i, rect in enumerate(self._vis_items):
+            level = max(0.0, min(1.0, float(lv[i])))
+            bh = int(level * max_bar) + 1
+            x0 = gap + i * (bw + gap); x1 = x0 + bw
+            cv.coords(rect, x0, cy - bh, x1, cy + bh)
+            cv.itemconfig(rect, fill=self._vis_color(level, i))
+
+    def _vis_render_radial(self, cv, w, h, lv):
+        g = self._vis_geom
+        cx = g["cx"]; cy = g["cy"]; R = g["R"]; cos = g["cos"]; sin = g["sin"]
+        max_len = min(w, h) * 0.30
+        for i, line in enumerate(self._vis_items):
+            level = max(0.0, min(1.0, float(lv[i])))
+            ln = level * max_len + 3
+            x0 = cx + R * cos[i];        y0 = cy + R * sin[i]
+            x1 = cx + (R + ln) * cos[i]; y1 = cy + (R + ln) * sin[i]
+            cv.coords(line, x0, y0, x1, y1)
+            cv.itemconfig(line, fill=self._vis_color(level, i))
+
+    def _vis_render_wave(self, cv, w, h, wav):
+        if self._vis_wave is None: return
+        m = self._wave_n
+        cy = h * 0.5
+        amp = h * 0.34
+        dx = w / (m - 1)
+        pts = []
+        if wav is None:
+            for i in range(m):
+                pts += [i * dx, cy]
+        else:
+            for i in range(m):
+                pts += [i * dx, cy - float(wav[i]) * amp]
+        cv.coords(self._vis_wave, *pts)
+
+    # ── Party: beat-reactive popping/flashing stars ──────────────────────────────
+    def _party_spawn(self, cv, w, h, energy):
+        glyph = random.choice(self._PARTY_GLYPHS)
+        color = random.choice(self._PARTY_COLORS)
+        x = random.uniform(w * 0.06, w * 0.94)
+        y = random.uniform(h * 0.16, h * 0.92)
+        size  = random.randint(18, 30 + int(34 * min(1.0, energy)))
+        flash = random.random() < 0.35          # ~a third just blink instead of fading
+        life  = random.randint(40, 85) if flash else random.randint(18, 42)
+        sid = cv.create_text(x, y, text=glyph, fill=color,
+                             font=(FF, max(1, int(size * 0.25))))
+        self._party_stars.append({
+            "id": sid, "x": x, "y": y,
+            "vx": random.uniform(-0.6, 0.6), "vy": random.uniform(-1.3, -0.2),
+            "size": size, "color": color, "flash": flash,
+            "age": 0, "life": life, "cur_sz": None})
+
+    def _vis_render_party(self, cv, w, h, t):
+        # ---- loudness (waveform RMS) + adaptive beat detection ----
+        wav = self.app._spectrum.wave(t, 1024) if t is not None else None
+        if wav is None:
+            energy = 0.0
+        else:
+            energy = float(np.sqrt(np.mean(wav.astype(np.float64) ** 2)))
+        avg = self._party_avg
+        beat = (wav is not None and energy > avg * 1.3
+                and energy > avg + 0.012 and energy > 0.02)
+        self._party_avg = avg * 0.90 + energy * 0.10
+
+        # ---- full-canvas flash on strong beats ----
+        self._party_flash = max(0.0, self._party_flash - 0.12)
+        if beat:
+            self._party_flash = min(1.0, self._party_flash + 0.55)
+        bg = _lerp_color("#050505", "#23233a", self._party_flash * 0.8)
+        try: cv.config(bg=bg)
+        except Exception: pass
+
+        # ---- spawn a burst of stars on the beat ----
+        if beat and len(self._party_stars) < 70:
+            for _ in range(3 + int(energy * 12)):
+                self._party_spawn(cv, w, h, energy)
+
+        # ---- advance + draw existing stars ----
+        dead = []
+        for st in self._party_stars:
+            st["age"] += 1
+            frac = st["age"] / st["life"]
+            if frac >= 1.0:
+                dead.append(st); continue
+            scale = 0.25 + 0.75 * (st["age"] / 6) if st["age"] < 6 else 1.0
+            st["x"] += st["vx"]; st["y"] += st["vy"]; st["vy"] += 0.04
+            if st["flash"]:                                   # blink bright/dim
+                b = 0.5 + 0.5 * float(np.sin(st["age"] * 0.6))
+                col = _lerp_color("#101010", st["color"], b)
+                sz  = int(st["size"] * scale)
+            else:                                             # pop then fade out
+                col = _lerp_color(st["color"], bg, frac)
+                sz  = int(st["size"] * scale * (1.0 - 0.3 * frac))
+            sz = max(1, sz)
+            cv.coords(st["id"], st["x"], st["y"])
+            if sz != st["cur_sz"]:
+                cv.itemconfig(st["id"], fill=col, font=(FF, sz)); st["cur_sz"] = sz
+            else:
+                cv.itemconfig(st["id"], fill=col)
+        for st in dead:
+            try: cv.delete(st["id"])
+            except Exception: pass
+            self._party_stars.remove(st)
 
     # ── Update tick ──────────────────────────────────────────────────────────────
     def _tick(self):
