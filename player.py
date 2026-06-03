@@ -523,7 +523,8 @@ class NowPlayingOverlay(Frame):
         self._vis_geom  = {}          # cached geometry for the active style
         self._vis_wave  = None        # canvas line id for waveform styles
         self._vis_modes = ["Bars", "Mirror", "Wave", "Radial",
-                           "Stereo", "Particles", "Geometry"]
+                           "Stereo", "Particles", "Geometry",
+                           "Warp", "Tunnel", "Disco", "Floor", "GIF"]
         self._vis_mode  = 0
         self._vis_hotspots = []       # on-canvas (x0,y0,x1,y1,action) controls
         # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars;
@@ -539,10 +540,48 @@ class NowPlayingOverlay(Frame):
         ]
         self._vis_theme = 0
         self._color_phase = 0.0       # advances each frame for the "Cycle" theme
+        # Background colour cycle — independent of the foreground "Cycle" theme:
+        # its own phase advances at a different speed and is offset half a wheel,
+        # so the background never shows the same colour as the visualizer.
+        self._bg_cycle    = False
+        self._vis_bg_base = "#050505" # current base background colour each frame
+        # Discrete, beat-driven background strobe: the palette is quantised so
+        # colours JUMP rather than slide, and beats trigger a bright flash. The
+        # half-wheel hue offset keeps it distinct from the "Cycle" theme.
+        self._bg_hue_steps = 12
+        self._bg_hue_idx   = 0
+        self._bg_step_t    = 0
+        self._bg_flash     = 0.0
+        self._bg_beat_avg  = 0.0
         # Particles / Geometry / beat state
         self._particles = []          # list of particle dicts (oval ids + motion)
+        self._shockwaves = []         # expanding beat rings for Particles
+        self._part_flash = 0.0        # full-field flash that fires on a beat
         self._geom_rot  = 0.0         # running rotation for Geometry
+        self._geom_kick = 0.0         # beat-driven zoom punch for Geometry
+        self._geom_rings  = []        # concentric rotating polygons
+        self._geom_spikes = []        # radial spikes that fire on beats
         self._beat_avg  = 0.0         # smoothed RMS for beat detection
+        # Warp / Tunnel state
+        self._stars = []              # 3-D starfield points (Warp)
+        self._tunnel_rings = []       # receding rings (Tunnel)
+        self._tunnel_phase = 0.0
+        # Disco ball state
+        self._disco_facets = []       # twinkling mirror facets (rect ids)
+        self._disco_beams  = []       # sweeping light-ray line ids
+        self._disco_rot    = 0.0
+        # Dance floor state
+        self._floor_tiles = []        # perspective floor tiles (polygon ids)
+        self._floor_phase = 0.0
+        # GIF visualizer state
+        self._gif_pil       = None    # list of raw PIL frames (None until chosen)
+        self._gif_frames    = []      # ImageTk frames sized to the canvas
+        self._gif_durations = []      # per-frame duration (ms)
+        self._gif_idx       = 0
+        self._gif_acc       = 0.0     # time accumulated toward the next frame
+        self._gif_item      = None    # canvas image id
+        self._gif_size      = None    # (w, h) the current frames were built for
+        self._gif_name      = ""
         self._build_ui()
 
     # ── Slide animation ─────────────────────────────────────────────────────
@@ -614,6 +653,13 @@ class NowPlayingOverlay(Frame):
                                activebackground=BG3, activeforeground=ACCENT,
                                command=self._cycle_vis_theme)
         self._vis_theme_btn.pack(side=RIGHT, padx=(0, 8))
+        # Toggle a flashing color-cycle background (independent of the theme)
+        self._vis_bg_btn = Button(hdr, text="🌈  BG Off",
+                               font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID, relief=FLAT,
+                               cursor="hand2", padx=12, pady=4,
+                               activebackground=BG3, activeforeground=ACCENT,
+                               command=self._toggle_bg_cycle)
+        self._vis_bg_btn.pack(side=RIGHT, padx=(0, 8))
         tip = Label(hdr, text="click title to close", font=(FF, 8),
                     bg="#0a0a0a", fg=TXT_DIM)
         tip.pack(side=RIGHT, padx=10)
@@ -1039,6 +1085,28 @@ class NowPlayingOverlay(Frame):
             self._vis_build()      # rebuild so the waveform line picks up the new color
         self.app._status.set(f"Visualizer theme: {name}")
 
+    def _toggle_bg_cycle(self):
+        """Turn the flashing color-cycle background on/off."""
+        self._bg_cycle = not self._bg_cycle
+        self._update_bg_btn()
+        if not self._bg_cycle:
+            self._vis_bg_base = "#050505"
+            if self._vis_cv:
+                try: self._vis_cv.config(bg="#050505")
+                except Exception: pass
+        if self._vis_on:
+            self._vis_build()      # rebuild so the on-canvas BG chip updates
+        self.app._status.set("Visualizer background: "
+                             + ("color cycle ON" if self._bg_cycle else "off"))
+
+    def _update_bg_btn(self):
+        try:
+            self._vis_bg_btn.config(
+                text="🌈  BG " + ("On" if self._bg_cycle else "Off"),
+                fg=ACCENT if self._bg_cycle else TXT_MID)
+        except Exception:
+            pass
+
     def _vis_color(self, level: float, i: int) -> str:
         """Color for bar/line `i` at intensity `level`, per the active theme."""
         theme = self._vis_themes[self._vis_theme]
@@ -1135,36 +1203,160 @@ class NowPlayingOverlay(Frame):
 
         elif mode == "Particles":
             self._particles = []
-            cnt = 130
+            cnt = 200
+            cx, cy = w * 0.5, h * 0.5
+            spawn_r = min(w, h) * 0.34          # start clustered near the middle
             for i in range(cnt):
-                x = random.uniform(0, w); y = random.uniform(0, h)
-                ang = random.uniform(0, 2 * np.pi)
-                spd = random.uniform(0.2, 1.0)
+                a   = random.uniform(0, 2 * np.pi)
+                rad = spawn_r * (random.random() ** 0.5)   # uniform over a disc
+                x   = cx + np.cos(a) * rad
+                y   = cy + np.sin(a) * rad
+                vang = random.uniform(0, 2 * np.pi)
+                spd  = random.uniform(0.5, 2.2)
                 self._particles.append({
                     "id": cv.create_oval(x, y, x, y, fill=ACCENT, width=0),
                     "x": x, "y": y,
-                    "vx": np.cos(ang) * spd, "vy": np.sin(ang) * spd,
-                    "base": random.uniform(1.5, 4.0),
+                    "vx": np.cos(vang) * spd, "vy": np.sin(vang) * spd,
+                    "base": random.uniform(2.0, 6.0),
+                    "spin": random.choice((-1.0, 1.0)),    # swirl direction
+                    "kickf": random.uniform(0.7, 1.6),     # per-particle beat kick
                     "hue": i / cnt, "cur_r": -1})
+            # Pool of expanding shockwave rings that fire on each beat.
+            self._shockwaves = []
+            for _i in range(6):
+                self._shockwaves.append({
+                    "id": cv.create_oval(0, 0, 0, 0, outline="", width=3,
+                                         state=HIDDEN),
+                    "r": 0.0, "life": 0.0})
+            self._part_flash = 0.0
             self._beat_avg = 0.0
 
         elif mode == "Geometry":
-            cx, cy = w * 0.5, h * 0.54
-            self._vis_geom.update(cx=cx, cy=cy, R=min(w, h) * 0.18)
-            # Two counter-rotating closed polygons (outer reacts, inner accents).
-            self._vis_items = [
-                cv.create_line(cx, cy, cx, cy, fill=theme["hi"], width=3,
-                               smooth=True, joinstyle=ROUND),
-                cv.create_line(cx, cy, cx, cy, fill=theme["lo"], width=2,
-                               smooth=True, joinstyle=ROUND)]
-            self._geom_rot = 0.0
+            cx, cy = w * 0.5, h * 0.52
+            self._vis_geom.update(cx=cx, cy=cy, R=min(w, h) * 0.16)
+            # A kaleidoscopic mandala: several concentric counter-rotating
+            # polygons, with a burst of radial spikes that punch out on beats.
+            self._geom_rings = []
+            for ri in range(5):
+                self._geom_rings.append(
+                    cv.create_line(cx, cy, cx, cy, fill=theme["hi"], width=2,
+                                   smooth=True, joinstyle=ROUND))
+            self._geom_spikes = []
+            for _i in range(self._vis_n):
+                self._geom_spikes.append(
+                    cv.create_line(cx, cy, cx, cy, fill=theme["hi"], width=1,
+                                   capstyle=ROUND))
+            self._geom_rot  = 0.0
+            self._geom_kick = 0.0
+
+        elif mode == "Warp":
+            cx, cy = w * 0.5, h * 0.5
+            self._vis_geom.update(cx=cx, cy=cy)
+            # 3-D starfield streaking past the camera; warps on the beat.
+            self._stars = []
+            for _i in range(180):
+                s = self._new_star()
+                s["id"] = cv.create_line(cx, cy, cx, cy, fill=WHITE, width=1)
+                self._stars.append(s)
+
+        elif mode == "Tunnel":
+            cx, cy = w * 0.5, h * 0.5
+            maxR = ((w * w + h * h) ** 0.5) * 0.6
+            self._vis_geom.update(cx=cx, cy=cy, maxR=maxR)
+            # Concentric rings rushing outward — like flying through a tunnel.
+            self._tunnel_rings = []
+            cnt = 20
+            for k in range(cnt):
+                self._tunnel_rings.append({
+                    "id": cv.create_oval(0, 0, 0, 0, outline=ACCENT, width=2),
+                    "p": k / cnt})
+            self._tunnel_phase = 0.0
+
+        elif mode == "Disco":
+            cx = w * 0.5; cy = h * 0.34
+            R  = min(w, h) * 0.16
+            self._vis_geom.update(cx=cx, cy=cy, R=R)
+            # Hanging wire from the ceiling.
+            cv.create_line(cx, 0, cx, cy - R, fill="#2a2a2a", width=2)
+            # Light rays first, so the ball sits over their origin.
+            self._disco_beams = []
+            for _i in range(14):
+                self._disco_beams.append(
+                    cv.create_line(cx, cy, cx, cy, fill=ACCENT_DK, width=2))
+            # Ball body.
+            cv.create_oval(cx - R, cy - R, cx + R, cy + R,
+                           outline="#202020", width=2, fill="#0a0a0a")
+            # Mirror facets — a grid wrapped onto the sphere (smaller toward the
+            # poles so it reads as a 3-D ball).
+            self._disco_facets = []
+            rows = 9
+            for ri in range(rows):
+                lat = -np.pi / 2 + np.pi * (ri + 0.5) / rows
+                y   = cy + R * np.sin(lat)
+                rr  = R * np.cos(lat)                     # ring radius here
+                cols = max(3, int(rows * np.cos(lat)) + 2)
+                fw  = (2 * rr) / cols
+                fh  = (R * np.pi / rows)
+                for ci in range(cols):
+                    fx = cx - rr + fw * (ci + 0.5)
+                    self._disco_facets.append({
+                        "id": cv.create_rectangle(
+                            fx - fw * 0.42, y - fh * 0.42,
+                            fx + fw * 0.42, y + fh * 0.42,
+                            fill="#1a1a1a", width=0),
+                        "hue": random.random(),
+                        "phase": random.random()})
+            self._disco_rot = 0.0
+
+        elif mode == "Floor":
+            cols, rows = 12, 9
+            horizon = h * 0.30
+            cxf = w * 0.5
+            self._vis_geom.update(cols=cols, rows=rows, horizon=horizon)
+            self._floor_tiles = []
+            def _proj(f):                                 # 0 near .. 1 horizon
+                return f / (2.0 - f)                      # perspective easing
+            for r in range(rows):
+                f0 = _proj(r / rows); f1 = _proj((r + 1) / rows)
+                y0 = h - (h - horizon) * f0
+                y1 = h - (h - horizon) * f1
+                hw0 = (w * 0.5) * (1.0 - 0.78 * f0)
+                hw1 = (w * 0.5) * (1.0 - 0.78 * f1)
+                for c in range(cols):
+                    ca = c / cols; cb = (c + 1) / cols
+                    xa0 = cxf - hw0 + 2 * hw0 * ca
+                    xa1 = cxf - hw0 + 2 * hw0 * cb
+                    xb0 = cxf - hw1 + 2 * hw1 * ca
+                    xb1 = cxf - hw1 + 2 * hw1 * cb
+                    tid = cv.create_polygon(xa0, y0, xa1, y0, xb1, y1, xb0, y1,
+                                            fill="#101010", outline="#060606",
+                                            width=1)
+                    self._floor_tiles.append(
+                        {"id": tid, "r": r, "c": c, "hue": random.random()})
+            self._floor_phase = 0.0
+
+        elif mode == "GIF":
+            self._gif_item = cv.create_image(w // 2, h // 2, anchor=CENTER)
+            if self._gif_pil and _PIL:
+                self._prepare_gif_frames(w, h)
+                if self._gif_frames:
+                    cv.itemconfig(self._gif_item, image=self._gif_frames[0])
+            else:
+                msg = ("Click  📁  GIF…  above to choose a GIF"
+                       if _PIL else
+                       "GIF visualizer needs Pillow — pip install pillow")
+                cv.create_text(w // 2, h // 2, text=msg,
+                               fill=TXT_MID, font=(FF, 14, "bold"))
 
         # On-canvas controls — a single row of chips pinned to the top-left so
         # they never overlap the centered song title beneath them.
         self._vis_hotspots = []
         chips = [("◑  " + mode,                              "style"),
                  ("🎨  " + self._vis_themes[self._vis_theme]["name"], "theme"),
-                 ("✕  Close",                                "close")]
+                 ("🌈  BG " + ("On" if self._bg_cycle else "Off"), "bg")]
+        if mode == "GIF":
+            chips.append(("📁  GIF…", "gif"))
+        chips.append(("✕  Close", "close"))
         cxp = 24
         for label, action in chips:
             cxp = self._vis_chip(cv, cxp, 28, label, action) + 10
@@ -1214,6 +1406,37 @@ class NowPlayingOverlay(Frame):
             t = min(time.time() - app._play_start, app._song_dur)
         mode = self._vis_modes[self._vis_mode]
 
+        # Base background colour for this frame. When the BG cycle is on it's a
+        # punchy strobe: the hue snaps between a fixed palette of colours (no
+        # gradual sliding) and each beat slams it to a NEW colour at full bright,
+        # decaying fast for a club-strobe feel. Particles manages its own bg so
+        # it can flash over this base.
+        if self._bg_cycle:
+            energy = app._spectrum.energy(t) if t is not None else 0.0
+            # Independent beat detector (doesn't disturb the foreground _beat).
+            if (energy > self._bg_beat_avg * 1.35 and
+                    energy > self._bg_beat_avg + 0.012 and energy > 0.02):
+                self._bg_hue_idx = (self._bg_hue_idx +
+                                    random.choice((2, 3, 5, 7))) % self._bg_hue_steps
+                self._bg_flash = 1.0
+            self._bg_beat_avg = self._bg_beat_avg * 0.9 + energy * 0.1
+            self._bg_flash *= 0.72                      # quick decay → strobe
+            # Keep snapping to new colours on a timer so it stays lively even
+            # through quiet passages with no clear beat.
+            self._bg_step_t += 1
+            if self._bg_step_t >= 8:                    # ~0.27s per colour
+                self._bg_step_t = 0
+                self._bg_hue_idx = (self._bg_hue_idx + 1) % self._bg_hue_steps
+            # Half-wheel offset → never the foreground "Cycle" colour.
+            hue = ((self._bg_hue_idx / self._bg_hue_steps) + 0.5) % 1.0
+            val = min(1.0, 0.10 + 0.60 * self._bg_flash)
+            self._vis_bg_base = _hsv_hex(hue, 0.9, val)
+        else:
+            self._vis_bg_base = "#050505"
+        if mode != "Particles":
+            try: cv.config(bg=self._vis_bg_base)
+            except Exception: pass
+
         if mode == "Wave":
             wav = app._spectrum.wave(t, self._wave_n) if t is not None else None
             self._vis_render_wave(cv, w, h, wav)
@@ -1236,6 +1459,11 @@ class NowPlayingOverlay(Frame):
             elif mode == "Radial":    self._vis_render_radial(cv, w, h, lv)
             elif mode == "Particles": self._vis_render_particles(cv, w, h, lv, t)
             elif mode == "Geometry":  self._vis_render_geometry(cv, w, h, lv, t)
+            elif mode == "Warp":      self._vis_render_warp(cv, w, h, lv, t)
+            elif mode == "Tunnel":    self._vis_render_tunnel(cv, w, h, lv, t)
+            elif mode == "Disco":     self._vis_render_disco(cv, w, h, lv, t)
+            elif mode == "Floor":     self._vis_render_floor(cv, w, h, lv, t)
+            elif mode == "GIF":       self._vis_render_gif(cv, w, h, lv, t)
 
         self._vis_anim_id = app.root.after(33, self._vis_tick)   # ~30 fps
 
@@ -1295,6 +1523,8 @@ class NowPlayingOverlay(Frame):
             if x0 <= event.x <= x1 and y0 <= event.y <= y1:
                 if   action == "style": self._cycle_vis_mode()
                 elif action == "theme": self._cycle_vis_theme()
+                elif action == "bg":    self._toggle_bg_cycle()
+                elif action == "gif":   self._load_gif()
                 else:                   self._toggle_visualizer()
                 return
         self._toggle_visualizer()          # click anywhere else closes
@@ -1338,62 +1568,324 @@ class NowPlayingOverlay(Frame):
 
     # ── Audio-reactive particle field ────────────────────────────────────────────
     def _vis_render_particles(self, cv, w, h, lv, t):
+        # Particles drift, swirl, and explode outward on beats; a spring keeps
+        # them in the visible middle and the edges bounce, so they never migrate
+        # off to the corners. Beats also fire a shockwave ring and flash the
+        # whole field for an extra-energetic feel.
         beat, energy = self._beat(t)
         cx, cy = w * 0.5, h * 0.5
-        drive  = 1.0 + energy * 4.0                  # global motion speeds up
+        home   = min(w, h) * 0.40        # radius they are gently held within
+        drive  = 1.0 + energy * 4.5      # global motion speeds up with the music
         theme  = self._vis_themes[self._vis_theme]
+        margin = 6
+        # Field flash — a quick whole-screen pulse on each beat that decays.
+        if beat:
+            self._part_flash = min(1.0, self._part_flash + 0.65 + energy)
+        self._part_flash *= 0.80
+        try:
+            if self._part_flash > 0.03:
+                cv.config(bg=_lerp_color(self._vis_bg_base, self._theme_lo(),
+                                         self._part_flash * 0.5))
+            else:
+                cv.config(bg=self._vis_bg_base)
+        except Exception:
+            pass
         for p in self._particles:
-            if beat:                                  # outward impulse on a beat
-                dx = p["x"] - cx; dy = p["y"] - cy
-                d  = (dx * dx + dy * dy) ** 0.5 or 1.0
-                kick = 2.5 + energy * 5.0
+            dx = p["x"] - cx; dy = p["y"] - cy
+            d  = (dx * dx + dy * dy) ** 0.5 or 1.0
+            if beat:                                  # explosive impulse on a beat
+                kick = (4.5 + energy * 11.0) * p["kickf"]
                 p["vx"] += dx / d * kick; p["vy"] += dy / d * kick
-            p["x"] += p["vx"] * drive; p["y"] += p["vy"] * drive
-            p["vx"] *= 0.96; p["vy"] *= 0.96          # drag
-            # wrap around screen edges
-            if p["x"] < -10: p["x"] = w + 10
-            if p["x"] > w + 10: p["x"] = -10
-            if p["y"] < -10: p["y"] = h + 10
-            if p["y"] > h + 10: p["y"] = -10
+                # Chaotic spark — a random shove so the burst scatters wildly.
+                p["vx"] += random.uniform(-1.0, 1.0) * (1.5 + energy * 5.0)
+                p["vy"] += random.uniform(-1.0, 1.0) * (1.5 + energy * 5.0)
+            # Spring back toward the centre — negligible inside the home radius,
+            # growing quickly once a particle strays past it.
+            pull = 0.0009 + 0.008 * max(0.0, (d - home) / home)
+            p["vx"] -= dx * pull; p["vy"] -= dy * pull
+            # Tangential swirl — per-particle direction, spins up with energy, so
+            # the field churns into a chaotic vortex instead of a tidy spin.
+            sw = (0.08 + energy * 0.32) * p["spin"]
+            p["vx"] += -dy / d * sw; p["vy"] += dx / d * sw
+            p["x"] += p["vx"] * drive;  p["y"] += p["vy"] * drive
+            p["vx"] *= 0.92; p["vy"] *= 0.92          # drag
+            # Bounce off the edges instead of wrapping to the far corner.
+            if   p["x"] < margin:     p["x"] = margin;     p["vx"] = abs(p["vx"]) * 0.6
+            elif p["x"] > w - margin: p["x"] = w - margin; p["vx"] = -abs(p["vx"]) * 0.6
+            if   p["y"] < margin:     p["y"] = margin;     p["vy"] = abs(p["vy"]) * 0.6
+            elif p["y"] > h - margin: p["y"] = h - margin; p["vy"] = -abs(p["vy"]) * 0.6
             level = max(0.0, min(1.0, energy * 2.2))
-            r = max(1, int(p["base"] * (0.7 + energy * 3.5)))
+            r = max(2, int(p["base"] * (0.8 + energy * 4.5)))
             x, y = p["x"], p["y"]
             cv.coords(p["id"], x - r, y - r, x + r, y + r)
             if r != p["cur_r"]:
                 p["cur_r"] = r
             if theme.get("cycle"):
                 col = _hsv_hex(self._color_phase + p["hue"] * 0.15,
-                               0.8, 0.4 + 0.6 * level)
+                               0.8, 0.45 + 0.55 * level)
             elif theme.get("rainbow"):
-                col = _hsv_hex(p["hue"] + level * 0.1, 0.8, 0.4 + 0.6 * level)
+                col = _hsv_hex(p["hue"] + level * 0.1, 0.8, 0.45 + 0.55 * level)
             else:
-                col = _lerp_color(theme["lo"], theme["hi"], level)
+                col = _lerp_color(theme["lo"], theme["hi"], 0.35 + 0.65 * level)
             cv.itemconfig(p["id"], fill=col)
+        # Shockwave rings — launch one on a beat, expand + fade the live ones.
+        if beat:
+            for sw in self._shockwaves:
+                if sw["life"] <= 0:
+                    sw["r"] = min(w, h) * 0.04; sw["life"] = 1.0
+                    break
+        hi = self._theme_hi()
+        for sw in self._shockwaves:
+            if sw["life"] > 0:
+                sw["r"]   += 9 + energy * 26
+                sw["life"] -= 0.045
+                rr = sw["r"]
+                cv.coords(sw["id"], cx - rr, cy - rr, cx + rr, cy + rr)
+                cv.itemconfig(sw["id"], state=NORMAL,
+                              outline=_lerp_color(hi, "#050505", 1.0 - sw["life"]),
+                              width=max(1, int(sw["life"] * 4)))
+            elif cv.itemcget(sw["id"], "state") != "hidden":
+                cv.itemconfig(sw["id"], state=HIDDEN)
 
-    # ── Audio-reactive rotating geometry ─────────────────────────────────────────
+    # ── Disco ball ───────────────────────────────────────────────────────────────
+    def _vis_render_disco(self, cv, w, h, lv, t):
+        beat, energy = self._beat(t)
+        g = self._vis_geom
+        cx, cy = g["cx"], g["cy"]
+        theme  = self._vis_themes[self._vis_theme]
+        self._disco_rot += 0.02 + energy * 0.06       # spin faster when louder
+        rot = self._disco_rot
+        # Twinkling facets — a rotating brightness wave plus beat sparkle.
+        for f in self._disco_facets:
+            b = 0.5 + 0.5 * np.sin(rot * 2.0 + f["phase"] * 6.283)
+            b *= (0.35 + 0.9 * min(1.0, 0.25 + energy * 2.2))
+            if beat and random.random() < 0.30:
+                b = 1.0
+            b = max(0.05, min(1.0, b))
+            if theme.get("cycle") or theme.get("rainbow"):
+                col = _hsv_hex((self._color_phase + f["hue"] * 0.4) % 1.0,
+                               0.55, 0.15 + 0.85 * b)
+            else:
+                col = _lerp_color("#101010", self._theme_hi(), b)
+            cv.itemconfig(f["id"], fill=col)
+        # Sweeping light rays fanning out from the ball.
+        nb = len(self._disco_beams) or 1
+        bl = min(w, h) * (0.45 + 0.6 * min(1.0, energy * 2.5))
+        for i, beam in enumerate(self._disco_beams):
+            a  = rot * 1.3 + i * (2 * np.pi / nb)
+            x1 = cx + np.cos(a) * bl
+            y1 = cy + np.sin(a) * bl
+            cv.coords(beam, cx, cy, x1, y1)
+            if theme.get("cycle") or theme.get("rainbow"):
+                col = _hsv_hex((self._color_phase + i / nb) % 1.0,
+                               0.85, 0.20 + 0.5 * min(1.0, energy * 2.0))
+            else:
+                col = _lerp_color(self._theme_lo(), self._theme_hi(),
+                                  min(1.0, energy * 1.6))
+            cv.itemconfig(beam, fill=col)
+
+    # ── Dance floor ──────────────────────────────────────────────────────────────
+    def _vis_render_floor(self, cv, w, h, lv, t):
+        beat, energy = self._beat(t)
+        g = self._vis_geom
+        cols, rows = g["cols"], g["rows"]
+        theme = self._vis_themes[self._vis_theme]
+        self._floor_phase += 0.06 + energy * 0.18
+        ph = self._floor_phase
+        n  = self._vis_n
+        for tile in self._floor_tiles:
+            c = tile["c"]; r = tile["r"]
+            band = float(lv[int(c / cols * (n - 1))])
+            wob  = 0.5 + 0.5 * np.sin(ph - r * 0.55 + c * 0.42)
+            b = band * 0.65 + wob * 0.35 * (0.3 + energy * 2.0)
+            if beat and ((r + c) % 2 == 0):
+                b += 0.5
+            b = max(0.0, min(1.0, b))
+            if theme.get("cycle") or theme.get("rainbow"):
+                col = _hsv_hex((self._color_phase + tile["hue"] * 0.5
+                                + c / cols * 0.3) % 1.0, 0.8, 0.10 + 0.9 * b)
+            else:
+                col = _lerp_color("#0b0b0b", self._theme_hi(), b)
+            cv.itemconfig(tile["id"], fill=col)
+
+    # ── GIF playback ─────────────────────────────────────────────────────────────
+    def _vis_render_gif(self, cv, w, h, lv, t):
+        if not self._gif_frames or self._gif_item is None:
+            return
+        _beat, energy = self._beat(t)
+        # Advance frames faster when the music is energetic.
+        self._gif_acc += 33 * (0.6 + energy * 3.5)
+        dur = self._gif_durations[self._gif_idx] if self._gif_durations else 80
+        if self._gif_acc >= max(20, dur):
+            self._gif_acc = 0.0
+            self._gif_idx = (self._gif_idx + 1) % len(self._gif_frames)
+            cv.itemconfig(self._gif_item, image=self._gif_frames[self._gif_idx])
+
+    def _prepare_gif_frames(self, w, h):
+        """Resize the loaded PIL frames to cover the (w, h) canvas, building the
+        ImageTk frames lazily and caching them per target size."""
+        if not self._gif_pil or not _PIL:
+            return
+        if self._gif_frames and self._gif_size == (w, h):
+            return
+        frames = []
+        for im in self._gif_pil:
+            try:
+                fr = im.convert("RGBA")
+                iw, ih = fr.size
+                scale  = max(w / iw, h / ih)          # cover the canvas
+                nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+                fr = fr.resize((nw, nh), Image.LANCZOS)
+                left = (nw - w) // 2; top = (nh - h) // 2
+                fr = fr.crop((left, top, left + w, top + h))
+                frames.append(ImageTk.PhotoImage(fr))
+            except Exception:
+                pass
+        self._gif_frames = frames
+        self._gif_size   = (w, h)
+        self._gif_idx    = 0
+        self._gif_acc    = 0.0
+
+    def _load_gif(self):
+        """Let the user pick a GIF (or still image) to use as the visualizer."""
+        if not _PIL:
+            self.app._status.set("GIF visualizer needs Pillow — pip install pillow")
+            return
+        path = filedialog.askopenfilename(
+            title="Choose a GIF (or image) for the visualizer",
+            filetypes=[("Images", "*.gif *.png *.jpg *.jpeg *.webp *.bmp"),
+                       ("GIF", "*.gif"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            im = Image.open(path)
+            frames, durs = [], []
+            try:
+                while True:
+                    frames.append(im.copy())
+                    durs.append(im.info.get("duration", 80) or 80)
+                    im.seek(im.tell() + 1)
+            except EOFError:
+                pass
+            if not frames:
+                frames = [im.copy()]; durs = [100]
+            self._gif_pil       = frames
+            self._gif_durations = durs
+            self._gif_frames    = []
+            self._gif_size      = None
+            self._gif_idx       = 0
+            self._gif_acc       = 0.0
+            self._gif_name      = Path(path).name
+            self.app._status.set(
+                f"Loaded GIF: {self._gif_name}  ({len(frames)} frame"
+                f"{'s' if len(frames) != 1 else ''})")
+            if self._vis_on and self._vis_modes[self._vis_mode] == "GIF":
+                self._vis_build()
+        except Exception as ex:
+            self.app._status.set(f"Couldn't load GIF: {ex}")
+
+    # ── Audio-reactive rotating geometry (kaleidoscopic mandala) ─────────────────
     def _vis_render_geometry(self, cv, w, h, lv, t):
         g = self._vis_geom
         cx, cy, R = g["cx"], g["cy"], g["R"]
-        _beat, energy = self._beat(t)
-        self._geom_rot += 0.012 + energy * 0.06       # spin faster when louder
+        beat, energy = self._beat(t)
+        # Beat-driven zoom punch that decays each frame for an explosive pulse.
+        if beat:
+            self._geom_kick = min(1.4, self._geom_kick + 0.7 + energy)
+        self._geom_kick *= 0.85
+        kick = self._geom_kick
+        self._geom_rot += 0.03 + energy * 0.22 + kick * 0.06
+        rot = self._geom_rot
         n = self._vis_n
-        Rscale = min(w, h) * 0.26
-        outer, inner = self._vis_items
-        op = []; ip = []
-        for i in range(n):
+        Rscale = min(w, h) * 0.30
+        n_rings = len(self._geom_rings)
+        # Concentric counter-rotating reactive polygons.
+        for ri, ring in enumerate(self._geom_rings):
+            direction = 1 if ri % 2 == 0 else -1
+            spin = rot * (1.0 + ri * 0.45) * direction
+            rad0 = R * (0.45 + ri * 0.34) * (1.0 + kick * 0.55)
+            amp  = Rscale * (0.45 + ri * 0.16)
+            off  = ri * 7
+            pts  = []
+            for i in range(n):
+                level = max(0.0, min(1.0, float(lv[(i + off) % n])))
+                a  = spin + (i / n) * 2 * np.pi
+                rr = rad0 + level * amp + kick * 28
+                pts += [cx + rr * np.cos(a), cy + rr * np.sin(a)]
+            pts += pts[:2]                            # close the loop
+            cv.coords(ring, *pts)
+            peak = max(0.0, min(1.0, energy * 1.8 + kick * 0.5))
+            cv.itemconfig(ring, fill=self._vis_color(peak, (ri * 11) % n),
+                          width=1 + int(kick * 3))
+        # Radial spikes that punch outward on the beat.
+        spike_len = min(w, h) * (0.16 + kick * 0.55)
+        for i, sp in enumerate(self._geom_spikes):
             level = max(0.0, min(1.0, float(lv[i])))
-            a_o = self._geom_rot + (i / n) * 2 * np.pi
-            ro  = R + level * Rscale
-            op += [cx + ro * np.cos(a_o), cy + ro * np.sin(a_o)]
-            a_i = -self._geom_rot * 1.4 + (i / n) * 2 * np.pi
-            ri  = R * 0.55 + level * Rscale * 0.5
-            ip += [cx + ri * np.cos(a_i), cy + ri * np.sin(a_i)]
-        op += op[:2]; ip += ip[:2]                    # close the loops
-        cv.coords(outer, *op)
-        cv.coords(inner, *ip)
-        peak = max(0.0, min(1.0, energy * 2.2))
-        cv.itemconfig(outer, fill=self._vis_color(peak, n // 2))
-        cv.itemconfig(inner, fill=self._vis_color(0.4 + 0.6 * peak, n // 4))
+            a  = -rot * 1.7 + (i / n) * 2 * np.pi
+            r0 = R * 0.3
+            r1 = r0 + (level * 0.45 + kick) * spike_len + level * 38
+            cv.coords(sp, cx + r0 * np.cos(a), cy + r0 * np.sin(a),
+                          cx + r1 * np.cos(a), cy + r1 * np.sin(a))
+            cv.itemconfig(sp, fill=self._vis_color(level, i),
+                          width=1 + int(level * 3 + kick * 2))
+
+    # ── 3-D warp starfield ───────────────────────────────────────────────────────
+    def _new_star(self):
+        """A fresh star at a random direction and full depth."""
+        return {"x": random.uniform(-1, 1), "y": random.uniform(-1, 1),
+                "z": random.uniform(0.1, 1.0), "id": None}
+
+    def _vis_render_warp(self, cv, w, h, lv, t):
+        beat, energy = self._beat(t)
+        g = self._vis_geom; cx, cy = g["cx"], g["cy"]
+        scale = min(w, h) * 0.55
+        speed = 0.008 + energy * 0.07
+        if beat:
+            speed += 0.06                              # warp jump on the beat
+        theme = self._vis_themes[self._vis_theme]
+        hi = self._theme_hi()
+        for s in self._stars:
+            pz = s["z"]
+            s["z"] -= speed
+            if s["z"] <= 0.03:                         # flew past — respawn far off
+                s["x"] = random.uniform(-1, 1)
+                s["y"] = random.uniform(-1, 1)
+                s["z"] = 1.0; pz = 1.0
+            z  = s["z"]
+            sx = cx + (s["x"] / z) * scale
+            sy = cy + (s["y"] / z) * scale
+            px = cx + (s["x"] / pz) * scale
+            py = cy + (s["y"] / pz) * scale
+            cv.coords(s["id"], px, py, sx, sy)
+            bright = max(0.0, min(1.0, (1.0 - z) * 1.3))
+            if theme.get("cycle") or theme.get("rainbow"):
+                col = _hsv_hex((self._color_phase + s["x"] * 0.2) % 1.0,
+                               0.7 - 0.5 * bright, 0.4 + 0.6 * bright)
+            else:
+                col = _lerp_color(self._theme_lo(), hi, bright)
+            cv.itemconfig(s["id"], fill=col, width=1 + int(bright * 2.5))
+
+    # ── Tunnel — rings rushing outward ───────────────────────────────────────────
+    def _vis_render_tunnel(self, cv, w, h, lv, t):
+        beat, energy = self._beat(t)
+        g = self._vis_geom; cx, cy = g["cx"], g["cy"]; maxR = g["maxR"]
+        spd = 0.004 + energy * 0.035
+        if beat:
+            spd += 0.025
+        self._tunnel_phase += spd
+        bass = float(np.mean(lv[:6]))                  # low-end drives the sway
+        ox = np.sin(self._tunnel_phase * 2.0) * 36 * bass
+        oy = np.cos(self._tunnel_phase * 1.7) * 36 * bass
+        n = self._vis_n
+        for ring in self._tunnel_rings:
+            p   = (ring["p"] + self._tunnel_phase) % 1.0
+            rad = maxR * (p * p)                       # perspective easing
+            cv.coords(ring["id"], cx + ox - rad, cy + oy - rad,
+                                  cx + ox + rad, cy + oy + rad)
+            band = float(lv[int(p * (n - 1))])
+            col  = self._vis_color(max(0.0, min(1.0, p * 0.5 + band * 0.7)),
+                                   int(p * n))
+            cv.itemconfig(ring["id"], outline=col, width=1 + int(p * 5))
 
     # ── Update tick ──────────────────────────────────────────────────────────────
     def _tick(self):
