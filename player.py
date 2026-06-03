@@ -903,7 +903,10 @@ class NowPlayingOverlay(Frame):
             self._vis_cv.bind("<Configure>", lambda _e: self._vis_build_bars())
         self._vis_levels = np.zeros(self._vis_n, dtype=np.float32)
         self._vis_cv.place(x=0, y=0, relwidth=1.0, relheight=1.0)
-        self._vis_cv.lift()
+        # NOTE: Canvas.lift / Canvas.tkraise are aliased to the canvas *item*
+        # raise command, so calling them bare raises a TclError. Use the base
+        # Misc.tkraise to raise the whole canvas widget in the stacking order.
+        Misc.tkraise(self._vis_cv)
         self._vis_build_bars()
         self._vis_tick()
 
