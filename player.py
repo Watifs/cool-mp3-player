@@ -19,11 +19,14 @@ Install:
 Optional — audio→lyrics transcription (the "wrong words? → transcribe" path):
     pip install faster-whisper        # recommended: no ffmpeg/PyTorch needed
     # (or)  pip install openai-whisper   # heavier; also needs ffmpeg on PATH
+    pip install demucs                # MUCH better lyrics on songs — isolates
+                                      # the vocals first (heavy: pulls in PyTorch,
+                                      # slow on CPU, used automatically if present)
 
 (librosa is NOT required — this build does no acoustic analysis.)
 """
 
-import os, re, io, json, time, uuid, queue, ctypes, random, colorsys, threading, datetime
+import os, sys, re, io, json, time, uuid, queue, ctypes, random, colorsys, threading, datetime, tempfile
 import urllib.request, urllib.parse
 from pathlib import Path
 from tkinter import *
@@ -75,11 +78,39 @@ _WHISPER       = _TRANSCRIBE_BACKEND is not None
 _whisper_model = None                     # lazily loaded + cached across calls
 WHISPER_MODEL  = "small"                  # bigger than 'base' → better lyric accuracy
 
-# ── Data files (kept inside THIS folder — separate from Solace) ────────────────
-_DIR           = Path(__file__).parent
+# Optional vocal isolation (Demucs). Songs transcribe far better when the
+# instruments are stripped out first and Whisper hears the voice alone. Heavy
+# (PyTorch) + slow on CPU, so it's used automatically ONLY when installed —
+# otherwise we transcribe the raw mix and the player still works.
+try:
+    import torch as _torch
+    from demucs.pretrained import get_model as _demucs_get_model
+    from demucs.apply import apply_model as _demucs_apply
+    _DEMUCS = True
+except Exception:
+    _torch = _demucs_get_model = _demucs_apply = None
+    _DEMUCS = False
+_demucs_model = None                       # lazily loaded + cached
+
+# ── Data files ────────────────────────────────────────────────────────────────
+# Running from source: keep the JSON next to the script (as before).
+# Running as a packaged app (PyInstaller .exe / .app): the bundle dir is
+# read-only / wiped each launch, so persist user data in a per-user location.
+if getattr(sys, "frozen", False):
+    if sys.platform == "darwin":
+        _DIR = Path.home() / "Library" / "Application Support" / "Cool MP3 Player"
+    elif os.name == "nt":
+        _DIR = Path(os.environ.get("APPDATA") or Path.home()) / "Cool MP3 Player"
+    else:
+        _DIR = Path.home() / ".cool_mp3_player"
+    try: _DIR.mkdir(parents=True, exist_ok=True)
+    except Exception: _DIR = Path(tempfile.gettempdir())
+else:
+    _DIR = Path(__file__).parent
 LIBRARY_FILE   = _DIR / "player_library.json"
 PLAYLISTS_FILE = _DIR / "player_playlists.json"
 LYRICS_FILE    = _DIR / "player_lyrics.json"
+LEARN_FILE     = _DIR / "player_learning.json"   # vocab + fixes from user edits
 
 MIXER_SR = 44100   # device sample rate (matches pygame.mixer.init above)
 
@@ -250,6 +281,24 @@ def parse_lrc(text: str):
     return out
 
 
+def strip_lrc_tags(text: str) -> str:
+    """Scrub LRC artefacts so the user never sees raw timestamps in plain lyrics.
+
+    Removes inline time tags ([01:23.45], [1:02]) and ID/metadata tags
+    ([ar:…], [ti:…], [length:…], [by:…]) while keeping the line layout intact,
+    so karaoke line-mapping stays 1:1. A no-op on text that's already clean."""
+    if not text:
+        return text
+    # Inline time tags, e.g. [01:23.45] / [1:02] — may appear several per line.
+    text = re.sub(r'\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]', '', text)
+    # Whole-line LRC header tags (key:value), e.g. [ar:Artist] / [length:03:21].
+    # The colon requirement spares lyric markers like [Chorus] / [Verse 1].
+    text = re.sub(r'(?m)^\s*\[[a-zA-Z#]+:[^\]]*\]\s*$', '', text)
+    # Tidy whitespace a stripped leading tag may have left behind.
+    text = re.sub(r'(?m)^[ \t]+', '', text)
+    return text.strip("\n")
+
+
 def fetch_lyrics_full(title: str, artist: str = "") -> dict:
     """Look up lyrics online, weighting the match toward the SONG NAME.
 
@@ -362,8 +411,76 @@ def _load_whisper():
     return _whisper_model
 
 
-def transcribe_audio(path: str) -> dict:
+def _decode_pcm_mono(path: str, sr: int):
+    """Decode any audio file to a mono float32 array at `sr` Hz WITHOUT needing
+    an ffmpeg binary — uses PyAV (bundled with faster-whisper)."""
+    try:
+        from faster_whisper.audio import decode_audio
+        return np.asarray(decode_audio(path, sampling_rate=sr), dtype=np.float32)
+    except Exception:
+        pass
+    import av
+    container = av.open(path)
+    resampler = av.audio.resampler.AudioResampler(
+        format="flt", layout="mono", rate=sr)
+    chunks = []
+    try:
+        for frame in container.decode(audio=0):
+            for rf in resampler.resample(frame):
+                chunks.append(rf.to_ndarray().reshape(-1))
+    finally:
+        container.close()
+    return (np.concatenate(chunks).astype(np.float32)
+            if chunks else np.zeros(0, np.float32))
+
+
+def separate_vocals(path: str):
+    """Isolate the vocal stem with Demucs so Whisper hears the voice alone.
+    Returns a temp WAV path (caller deletes it) or None if unavailable/failed.
+    Decodes + writes audio itself, so NO ffmpeg binary is required."""
+    if not _DEMUCS:
+        return None
+    global _demucs_model
+    try:
+        if _demucs_model is None:
+            # htdemucs = default 4-stem model (drums/bass/other/vocals).
+            _demucs_model = _demucs_get_model("htdemucs")
+            _demucs_model.cpu(); _demucs_model.eval()
+        sr   = _demucs_model.samplerate
+        mono = _decode_pcm_mono(path, sr)
+        if mono.size == 0:
+            return None
+        # Demucs expects (channels, samples); feed mono duplicated to stereo.
+        wav   = _torch.from_numpy(np.stack([mono, mono], axis=0))
+        ref   = wav.mean(0)
+        wav_n = (wav - ref.mean()) / (ref.std() + 1e-8)
+        with _torch.no_grad():
+            sources = _demucs_apply(_demucs_model, wav_n[None],
+                                    device="cpu", split=True, overlap=0.25,
+                                    progress=False)[0]
+        sources = sources * ref.std() + ref.mean()
+        stems   = dict(zip(_demucs_model.sources, sources))
+        vocals  = stems.get("vocals")
+        if vocals is None:
+            return None
+        v = np.clip(vocals.mean(0).cpu().numpy(), -1.0, 1.0)   # mono float
+        out = os.path.join(tempfile.gettempdir(),
+                           f"coolmp3_vocals_{uuid.uuid4().hex}.wav")
+        import wave as _wave
+        with _wave.open(out, "w") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+            w.writeframes((v * 32767).astype(np.int16).tobytes())
+        return out
+    except Exception:
+        return None
+
+
+def transcribe_audio(path: str, on_status=None) -> dict:
     """Transcribe a song's vocals to lyrics with a local Whisper model.
+
+    When Demucs is installed the vocals are isolated FIRST (huge accuracy win
+    on real songs); otherwise the raw mix is transcribed. `on_status(msg)` is
+    an optional progress callback.
 
     Returns {'plain': str, 'synced': [[t, line], ...] or None, 'error': str}.
     The synced timings come from each segment's start time, so a transcript
@@ -372,31 +489,58 @@ def transcribe_audio(path: str) -> dict:
     if not _WHISPER:
         return {"plain": "", "synced": None,
                 "error": "no transcription backend installed"}
+
+    def _say(m):
+        if on_status:
+            try: on_status(m)
+            except Exception: pass
+
+    audio_path, tmp_vocals = path, None
     try:
+        if _DEMUCS:
+            _say("isolating vocals (this is the slow part)")
+            tmp_vocals = separate_vocals(path)
+            if tmp_vocals:
+                audio_path = tmp_vocals
+        _say("transcribing")
         model  = _load_whisper()
-        synced = []
+        # Bias the decoder toward words the user has taught us from past edits.
+        learn   = load_learning()
+        hints   = build_transcribe_hints(learn.get("vocab", {}))
+        prompt  = ("Song lyrics: " + hints) if hints else "Song lyrics:"
+        synced  = []
         if _TRANSCRIBE_BACKEND == "faster":
             # vad_filter skips silence/instrumental gaps; language auto-detects.
+            # condition_on_previous_text=False stops it looping a repeated hook.
+            # hotwords reinforces the learned vocabulary per decode window.
             segments, _info = model.transcribe(
-                path, vad_filter=True, beam_size=5,
-                initial_prompt="Song lyrics:")
+                audio_path, vad_filter=True, beam_size=5,
+                condition_on_previous_text=False,
+                initial_prompt=prompt, hotwords=hints or None)
             for seg in segments:                  # generator — runs the decode
                 line = (seg.text or "").strip()
                 if line:
                     synced.append([round(float(seg.start), 2), line])
         else:
-            # condition_on_previous_text=False stops Whisper looping a hook.
-            result = model.transcribe(path, fp16=False, verbose=False,
+            result = model.transcribe(audio_path, fp16=False, verbose=False,
                                       condition_on_previous_text=False,
-                                      initial_prompt="Song lyrics:")
+                                      initial_prompt=prompt)
             for seg in result.get("segments", []):
                 line = (seg.get("text") or "").strip()
                 if line:
                     synced.append([round(float(seg.get("start", 0.0)), 2), line])
+        # Auto-apply the "misheard → correct" fixes learned from past edits.
+        fixes = learn.get("fixes", {})
+        if fixes:
+            synced = [[t, apply_learned_fixes(l, fixes)] for t, l in synced]
         plain = "\n".join(l for _t, l in synced)
         return {"plain": plain, "synced": synced or None, "error": ""}
     except Exception as e:
         return {"plain": "", "synced": None, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        if tmp_vocals:
+            try: os.remove(tmp_vocals)
+            except Exception: pass
 
 
 def load_lyrics_db() -> dict:
@@ -411,6 +555,124 @@ def save_lyrics_db(db: dict):
         with open(LYRICS_FILE, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
     except Exception: pass
+
+
+# ==============================================================================
+#  TRANSCRIPTION LEARNING  (user corrections → better future transcriptions)
+# ==============================================================================
+# Whisper's weights can't be meaningfully fine-tuned from a handful of song
+# edits on a CPU, so instead we make the corrections *steer* future decodes,
+# the way Whisper natively supports:
+#   • vocab  — distinctive words the user actually uses (artist names, slang,
+#              stylised spellings) get fed back as `hotwords` / `initial_prompt`
+#              so the decoder is biased toward them.
+#   • fixes  — "misheard phrase → correct phrase" pairs, learned by diffing the
+#              AI's transcript against the user's edit, auto-applied afterwards.
+# The more the user corrects, the smarter both get. Stored in LEARN_FILE.
+_STOPWORDS = {
+    "the","and","you","your","that","this","with","for","are","was","but","not",
+    "all","can","her","his","she","him","they","them","what","when","then","than",
+    "have","has","had","will","would","could","should","its","our","out","get",
+    "got","one","two","like","just","now","let","yeah","oh","ohh","ooh","la","na",
+}
+
+def load_learning() -> dict:
+    if not LEARN_FILE.exists():
+        return {"vocab": {}, "fixes": {}}
+    try:
+        with open(LEARN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        d.setdefault("vocab", {}); d.setdefault("fixes", {})
+        return d
+    except Exception:
+        return {"vocab": {}, "fixes": {}}
+
+def save_learning(d: dict):
+    try:
+        with open(LEARN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _learn_vocab(text: str, vocab: dict):
+    """Fold the words of a user-confirmed lyric into the vocab frequency store.
+    Each entry is [count, best_display] — a capitalised form (likely a proper
+    noun) is preferred as the display since those help the decoder most."""
+    for w in re.findall(r"[A-Za-z][A-Za-z']{2,}", text):
+        key = w.lower()
+        cur = vocab.get(key)
+        if cur:
+            cur[0] += 1
+            if w[0].isupper() and not cur[1][0].isupper():
+                cur[1] = w
+        else:
+            vocab[key] = [1, w]
+
+def _learn_fixes(old_text: str, new_text: str, fixes: dict):
+    """Diff the AI transcript against the user's correction and remember the
+    short phrases that were swapped, so the same mishearing is auto-fixed next
+    time. Conservative: only 1–4 word spans, skips pure-stopword/short noise."""
+    import difflib
+    a, b = old_text.split(), new_text.split()
+    sm = difflib.SequenceMatcher(a=[w.lower() for w in a],
+                                 b=[w.lower() for w in b])
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        if not (1 <= i2 - i1 <= 4 and 1 <= j2 - j1 <= 4):
+            continue
+        wrong = " ".join(a[i1:i2]).strip(" .,!?\"'")
+        right = " ".join(b[j1:j2]).strip(" .,!?\"'")
+        wl = wrong.lower()
+        if len(wrong) < 3 or wl == right.lower():
+            continue
+        # Skip swaps that are only filler/stopwords (too risky to generalise).
+        if all(w in _STOPWORDS for w in wl.split()):
+            continue
+        fixes[wl] = right
+
+def learn_from_user_lyrics(new_text: str, prev_text: str = "",
+                           prev_source: str = "") -> tuple:
+    """Update the learning store from a user-saved lyric. Always harvests vocab;
+    learns phrase fixes only when correcting a previous AI transcript.
+    Returns (vocab_size, fixes_size)."""
+    if not new_text:
+        return 0, 0
+    data  = load_learning()
+    vocab = {k: list(v) for k, v in data.get("vocab", {}).items()}
+    fixes = dict(data.get("fixes", {}))
+    _learn_vocab(new_text, vocab)
+    if prev_source == "transcribed" and prev_text:
+        _learn_fixes(prev_text, new_text, fixes)
+    data["vocab"], data["fixes"] = vocab, fixes
+    save_learning(data)
+    return len(vocab), len(fixes)
+
+def build_transcribe_hints(vocab: dict, limit: int = 40) -> str:
+    """Turn the learned vocab into a short bias string for Whisper. Ranks by
+    frequency, drops common stopwords, and favours distinctive words."""
+    ranked = sorted(
+        (v for k, v in vocab.items() if k not in _STOPWORDS),
+        key=lambda v: v[0], reverse=True)
+    words, seen = [], set()
+    for _n, disp in ranked:
+        d = disp.strip()
+        if d.lower() in seen:
+            continue
+        seen.add(d.lower()); words.append(d)
+        if len(words) >= limit:
+            break
+    return " ".join(words)
+
+def apply_learned_fixes(text: str, fixes: dict) -> str:
+    """Apply the learned 'misheard → correct' phrase swaps to a transcript.
+    Longest phrases first so multi-word fixes win over their sub-phrases."""
+    if not text or not fixes:
+        return text
+    for wrong in sorted(fixes, key=len, reverse=True):
+        text = re.sub(r"(?<!\w)" + re.escape(wrong) + r"(?!\w)",
+                      fixes[wrong], text, flags=re.I)
+    return text
 
 
 # ==============================================================================
@@ -948,10 +1210,13 @@ class NowPlayingOverlay(Frame):
         sb.config(command=self._lyr_txt.yview)
         sb.pack(side=RIGHT, fill=Y)
         self._lyr_txt.pack(side=LEFT, fill=BOTH, expand=True)
-        # "active" = the line currently being sung (synced lyrics); "dim" = the rest.
+        # Karaoke styling: every line is dimmed by default; the line currently
+        # being sung lights up bright + bold. "active" is raised above "dim" so
+        # its colour wins on the overlapping (sung) line.
+        self._lyr_txt.tag_configure("dim", foreground=TXT_MID)
         self._lyr_txt.tag_configure("active", foreground=ACCENT_HI,
                                     font=(FF, 13, "bold"))
-        self._lyr_txt.tag_configure("dim", foreground=TXT_MID)
+        self._lyr_txt.tag_raise("active")
         # Detect manual scrolling so auto-scroll can yield, then resume.
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>",
                     "<Up>", "<Down>", "<Prior>", "<Next>"):
@@ -1131,7 +1396,12 @@ class NowPlayingOverlay(Frame):
     def _save_lyrics(self):
         song = self._current_song()
         if not song: return
-        text = self._lyr_txt.get("1.0", END).strip()
+        text = strip_lrc_tags(self._lyr_txt.get("1.0", END).strip())
+        # Learn from the correction BEFORE overwriting the old entry: harvest the
+        # user's vocabulary and, when fixing an AI transcript, the phrase swaps.
+        prev = self.app.lyrics_db.get(song.path, {})
+        n_vocab, n_fixes = learn_from_user_lyrics(
+            text, prev.get("lyrics", ""), prev.get("source", ""))
         self.app.lyrics_db[song.path] = {"lyrics": text, "source": "user"}
         save_lyrics_db(self.app.lyrics_db)
         self.app._uq.put(song)
@@ -1144,7 +1414,13 @@ class NowPlayingOverlay(Frame):
         self._lyr_txt.config(state=DISABLED)
         self._lyr_edit_btn.config(text="✏ Edit", fg=TXT_MID)
         self._lyr_save_btn.config(state=DISABLED, bg=BG4)
-        self.app._status.set(f"✏ Lyrics saved for '{song.name}'")
+        msg = f"✏ Lyrics saved for '{song.name}'"
+        if n_fixes or n_vocab:
+            learned = []
+            if n_fixes: learned.append(f"{n_fixes} correction(s)")
+            if n_vocab: learned.append(f"{n_vocab} words")
+            msg += "  ·  learned " + " + ".join(learned) + " to improve transcribing"
+        self.app._status.set(msg)
 
     def _set_lyrics_text(self, text: str):
         self._lyr_txt.config(state=NORMAL)
@@ -1155,7 +1431,12 @@ class NowPlayingOverlay(Frame):
                        "other languages too). If the words are WRONG, click\n"
                        "Generate again to transcribe them straight from the\n"
                        "audio — or use  ✏ Edit  to add them manually.")
+        self._lyr_txt.tag_remove("dim", "1.0", END)
         self._lyr_txt.insert("1.0", text if text else placeholder)
+        # Dim real lyrics so the sung line can stand out; leave the placeholder
+        # at full brightness and editable text undimmed for legibility.
+        if text and not self._lyrics_editing:
+            self._lyr_txt.tag_add("dim", "1.0", END)
         if not self._lyrics_editing:
             self._lyr_txt.config(state=DISABLED)
         self._active_lyr_ln = -1
@@ -1187,8 +1468,9 @@ class NowPlayingOverlay(Frame):
         if self._synced:
             text = "\n".join(txt for _t, txt in self._synced)
         else:
-            text = (self.app.lyrics_db.get(song.path, {}).get("lyrics", "")
-                    if song else "")
+            text = strip_lrc_tags(
+                self.app.lyrics_db.get(song.path, {}).get("lyrics", "")
+                if song else "")
         self._set_lyrics_text(text)
 
     def _highlight_line(self, ln: int, scroll: bool = True):
@@ -1242,20 +1524,24 @@ class NowPlayingOverlay(Frame):
             if not cur or "No lyrics" in cur:
                 self._lyr_was_user_scroll = user_active
                 return
+            # No per-line timings: estimate the sung line from how far we are
+            # through the song and highlight it karaoke-style, landing on a real
+            # (non-blank) line rather than an instrumental gap.
+            lines = cur.split("\n")
+            n = len(lines)
             base = pos / app._song_dur
-            if user_active:
-                # Track where the user parked the view, relative to playback,
-                # so auto-scroll can continue from there once they stop.
-                try:
-                    self._lyr_scroll_offset = self._lyr_txt.yview()[0] - base
-                except Exception:
-                    pass
-            else:
-                try:
-                    self._lyr_txt.yview_moveto(
-                        max(0.0, min(1.0, base + self._lyr_scroll_offset)))
-                except Exception:
-                    pass
+            idx = max(0, min(n - 1, int(base * n)))
+            if not lines[idx].strip():
+                fwd = next((j for j in range(idx, n) if lines[j].strip()), None)
+                bwd = next((j for j in range(idx, -1, -1) if lines[j].strip()), None)
+                idx = fwd if fwd is not None else (bwd if bwd is not None else idx)
+            ln = idx + 1
+            if ln != self._active_lyr_ln:
+                self._highlight_line(ln, scroll=not user_active)
+                self._active_lyr_ln = ln
+            elif self._lyr_was_user_scroll and not user_active:
+                # Grace just elapsed → re-centre on the estimated line once.
+                self._highlight_line(ln, scroll=True)
 
         self._lyr_was_user_scroll = user_active
 
@@ -1321,14 +1607,20 @@ class NowPlayingOverlay(Frame):
         self._lyr_attempts[song.path] = self._lyr_attempts.get(song.path, 1) + 1
         self._lyr_busy = True
         self._lyr_fetch_btn.config(text="… listening", state=DISABLED)
+        extra = ("isolating vocals first — can take a few minutes per song"
+                 if _DEMUCS else
+                 "tip: pip install demucs for far better accuracy on songs")
         self.app._status.set(
-            f"🎙 Transcribing '{song.title or song.name}' from audio  ·  "
-            f"first run loads the model, please wait…")
+            f"🎙 Transcribing '{song.title or song.name}' from audio  ·  {extra}…")
         threading.Thread(target=self._transcribe_bg, args=(song,),
                          daemon=True).start()
 
     def _transcribe_bg(self, song):
-        res = transcribe_audio(song.path)
+        name = song.title or song.name
+        def status(msg):
+            self.app.root.after(0, lambda: self.app._status.set(
+                f"🎙 {msg} — '{name}'…"))
+        res = transcribe_audio(song.path, on_status=status)
         self.app.root.after(0, lambda: self._transcribe_done(song, res))
 
     def _transcribe_done(self, song, res):
@@ -3340,7 +3632,7 @@ class PlayerApp:
 
     def _store_lyrics(self, song, plain, synced=None, source="auto"):
         """Persist a lyric result (plus optional line timings) for `song`."""
-        entry = {"lyrics": plain, "source": source}
+        entry = {"lyrics": strip_lrc_tags(plain), "source": source}
         if synced:
             entry["synced"] = synced
         self.lyrics_db[song.path] = entry

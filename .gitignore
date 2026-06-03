@@ -9,3 +9,10 @@ venv/
 player_library.json
 player_playlists.json
 player_lyrics.json
+player_learning.json
+
+# Packaging: keep the build scripts/specs under packaging/, but not the heavy
+# build outputs. Ship the .exe / .dmg via GitHub Releases, not in git history.
+build/
+*-venv/
+dist/
