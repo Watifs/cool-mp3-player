@@ -526,7 +526,8 @@ class NowPlayingOverlay(Frame):
                            "Stereo", "Particles", "Geometry"]
         self._vis_mode  = 0
         self._vis_hotspots = []       # on-canvas (x0,y0,x1,y1,action) controls
-        # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars
+        # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars;
+        # "cycle" continuously shifts the whole visualizer through the spectrum.
         self._vis_themes = [
             {"name": "Aqua",    "lo": ACCENT_DK, "hi": ACCENT_HI},
             {"name": "Fire",    "lo": "#5a1200", "hi": "#ffd54a"},
@@ -534,8 +535,10 @@ class NowPlayingOverlay(Frame):
             {"name": "Ice",     "lo": "#0a2a5e", "hi": "#9be3ff"},
             {"name": "Sunset",  "lo": "#42126b", "hi": "#ff9e3d"},
             {"name": "Rainbow", "lo": "#ff0040", "hi": "#40ffd0", "rainbow": True},
+            {"name": "Cycle",   "lo": "#ff0040", "hi": "#40ffd0", "cycle": True},
         ]
         self._vis_theme = 0
+        self._color_phase = 0.0       # advances each frame for the "Cycle" theme
         # Particles / Geometry / beat state
         self._particles = []          # list of particle dicts (oval ids + motion)
         self._geom_rot  = 0.0         # running rotation for Geometry
@@ -1039,10 +1042,27 @@ class NowPlayingOverlay(Frame):
     def _vis_color(self, level: float, i: int) -> str:
         """Color for bar/line `i` at intensity `level`, per the active theme."""
         theme = self._vis_themes[self._vis_theme]
+        if theme.get("cycle"):
+            hue = (self._color_phase + i * 0.004) % 1.0
+            return _hsv_hex(hue, 0.85, 0.35 + 0.65 * level)
         if theme.get("rainbow"):
             hue = (i / max(1, self._vis_n) + level * 0.08) % 1.0
             return _hsv_hex(hue, 0.85, 0.35 + 0.65 * level)
         return _lerp_color(theme["lo"], theme["hi"], level)
+
+    def _theme_hi(self) -> str:
+        """Active theme's bright color (animated when the theme cycles)."""
+        theme = self._vis_themes[self._vis_theme]
+        if theme.get("cycle"):
+            return _hsv_hex(self._color_phase, 0.85, 0.95)
+        return theme["hi"]
+
+    def _theme_lo(self) -> str:
+        """Active theme's dark color (animated when the theme cycles)."""
+        theme = self._vis_themes[self._vis_theme]
+        if theme.get("cycle"):
+            return _hsv_hex((self._color_phase + 0.5) % 1.0, 0.85, 0.45)
+        return theme["lo"]
 
     # ── Visualizer: build the canvas items for the active style ──────────────────
     def _vis_build(self):
@@ -1139,17 +1159,18 @@ class NowPlayingOverlay(Frame):
                                smooth=True, joinstyle=ROUND)]
             self._geom_rot = 0.0
 
-        # Header text over the visualizer
-        self._vis_title = cv.create_text(
-            w // 2, int(h * 0.09), text="", fill=TXT, font=(FF, 16, "bold"))
-        # On-canvas controls (clickable while the visualizer is showing)
+        # On-canvas controls — a single row of chips pinned to the top-left so
+        # they never overlap the centered song title beneath them.
         self._vis_hotspots = []
         chips = [("◑  " + mode,                              "style"),
                  ("🎨  " + self._vis_themes[self._vis_theme]["name"], "theme"),
                  ("✕  Close",                                "close")]
-        cxp = int(w * 0.5) - 200
+        cxp = 24
         for label, action in chips:
-            cxp = self._vis_chip(cv, cxp, int(h * 0.09) + 30, label, action) + 10
+            cxp = self._vis_chip(cv, cxp, 28, label, action) + 10
+        # Song title — centered, sitting clearly below the control row.
+        self._vis_title = cv.create_text(
+            w // 2, 70, text="", fill=TXT, font=(FF, 16, "bold"))
         self._vis_built = True
 
     def _vis_chip(self, cv, x, y, label, action):
@@ -1183,6 +1204,10 @@ class NowPlayingOverlay(Frame):
                           text=(song.title or song.name) if song else "Nothing playing")
         except Exception:
             pass
+
+        # Advance the color phase so the "Cycle" theme drifts through the
+        # spectrum (~2.8s per full loop at 30fps).
+        self._color_phase = (self._color_phase + 0.012) % 1.0
 
         t = None
         if app._playing and app._song_dur > 0:
@@ -1262,6 +1287,7 @@ class NowPlayingOverlay(Frame):
             for i in range(m):
                 pts += [i * dx, cy - float(wav[i]) * amp]
         cv.coords(self._vis_wave, *pts)
+        cv.itemconfig(self._vis_wave, fill=self._theme_hi())
 
     # ── On-canvas control clicks ─────────────────────────────────────────────────
     def _vis_click(self, event):
@@ -1285,7 +1311,7 @@ class NowPlayingOverlay(Frame):
     def _vis_render_stereo(self, cv, w, h, t):
         g = self._vis_geom
         st = self.app._spectrum.stereo(t, 256) if t is not None else None
-        theme = self._vis_themes[self._vis_theme]
+        lo, hi = self._theme_lo(), self._theme_hi()
         cx, cy, R = g["cx"], g["cy"], g["R"]
         if st is None:
             cv.coords(self._vis_wave, cx, cy, cx, cy)
@@ -1301,13 +1327,14 @@ class NowPlayingOverlay(Frame):
             cv.coords(self._vis_wave, *pts)
             L  = float(np.sqrt(np.mean(left.astype(np.float64) ** 2)))
             Rr = float(np.sqrt(np.mean(right.astype(np.float64) ** 2)))
+        cv.itemconfig(self._vis_wave, fill=hi)
         # Level meters (clamp RMS into a readable range).
         top = h * 0.18; bot = h * 0.86; span = bot - top
         for key, val in (("lm", L), ("rm", Rr)):
             lvl = max(0.0, min(1.0, val * 3.2))
             bx0 = g[key + "_x"]; bx1 = bx0 + g["meter_w"]
             cv.coords(g[key], bx0, bot - lvl * span, bx1, bot)
-            cv.itemconfig(g[key], fill=_lerp_color(theme["lo"], theme["hi"], lvl))
+            cv.itemconfig(g[key], fill=_lerp_color(lo, hi, lvl))
 
     # ── Audio-reactive particle field ────────────────────────────────────────────
     def _vis_render_particles(self, cv, w, h, lv, t):
@@ -1334,9 +1361,13 @@ class NowPlayingOverlay(Frame):
             cv.coords(p["id"], x - r, y - r, x + r, y + r)
             if r != p["cur_r"]:
                 p["cur_r"] = r
-            col = (_hsv_hex(p["hue"] + level * 0.1, 0.8, 0.4 + 0.6 * level)
-                   if theme.get("rainbow")
-                   else _lerp_color(theme["lo"], theme["hi"], level))
+            if theme.get("cycle"):
+                col = _hsv_hex(self._color_phase + p["hue"] * 0.15,
+                               0.8, 0.4 + 0.6 * level)
+            elif theme.get("rainbow"):
+                col = _hsv_hex(p["hue"] + level * 0.1, 0.8, 0.4 + 0.6 * level)
+            else:
+                col = _lerp_color(theme["lo"], theme["hi"], level)
             cv.itemconfig(p["id"], fill=col)
 
     # ── Audio-reactive rotating geometry ─────────────────────────────────────────
@@ -1602,6 +1633,11 @@ class PlayerApp:
                relief=FLAT, cursor="hand2", padx=14, pady=7,
                activebackground=BG4, activeforeground=ACCENT,
                command=self._play_all_library).pack(side=RIGHT, padx=(6, 0))
+        self._gen_all_btn = Button(bar, text="♪  Generate Lyrics", font=(FF, 10, "bold"),
+               bg=BG3, fg=TXT, relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=self._generate_all_lyrics)
+        self._gen_all_btn.pack(side=RIGHT, padx=(6, 0))
 
         Frame(parent, bg=BORDER, height=1).pack(fill=X)
 
@@ -1837,6 +1873,54 @@ class PlayerApp:
         self._update_shuf_btn()
         self._play_playlist(songs, 0)
         self._status.set(f"🔀 Shuffling all {len(songs)} songs from your library")
+
+    # ── Bulk lyrics generation ──────────────────────────────────────────────────
+    def _generate_all_lyrics(self):
+        """Look up lyrics for every library song that doesn't have them yet."""
+        if getattr(self, "_lyrics_all_running", False):
+            self._status.set("Already generating lyrics — please wait…"); return
+        if not self.songs:
+            self._status.set("No songs in your library yet"); return
+        todo = [s for s in self.songs if not s.failed and
+                (s.path not in self.lyrics_db or
+                 not self.lyrics_db[s.path].get("lyrics"))]
+        if not todo:
+            self._status.set("All songs already have lyrics  ♪"); return
+        if not messagebox.askyesno(
+                "Generate Lyrics for All",
+                f"Look up lyrics for {len(todo)} song(s) that don't have them yet?\n\n"
+                f"This fetches from the internet and may take a little while."):
+            return
+        self._lyrics_all_running = True
+        try: self._gen_all_btn.config(state=DISABLED, text="♪  Generating…")
+        except Exception: pass
+        threading.Thread(target=self._generate_all_lyrics_bg,
+                         args=(todo,), daemon=True).start()
+
+    def _generate_all_lyrics_bg(self, todo):
+        found, total = 0, len(todo)
+        for i, song in enumerate(todo, 1):
+            # Another worker may have filled these in the meantime — skip if so.
+            if (song.path in self.lyrics_db and
+                    self.lyrics_db[song.path].get("lyrics")):
+                continue
+            self.root.after(0, lambda i=i, s=song: self._status.set(
+                f"♪ Generating lyrics {i}/{total}: {s.title or s.name}…"))
+            lyrics = fetch_lyrics(song.title or song.name, song.artist)
+            if lyrics:
+                self.lyrics_db[song.path] = {"lyrics": lyrics, "source": "auto"}
+                save_lyrics_db(self.lyrics_db)
+                self._uq.put(song)
+                found += 1
+            time.sleep(0.4)   # be polite to the free lyrics APIs
+        self.root.after(0, lambda: self._generate_all_lyrics_done(found, total))
+
+    def _generate_all_lyrics_done(self, found, total):
+        self._lyrics_all_running = False
+        try: self._gen_all_btn.config(state=NORMAL, text="♪  Generate Lyrics")
+        except Exception: pass
+        save_library(self.songs)
+        self._status.set(f"♪ Lyrics found for {found} of {total} song(s)")
 
     def _lib_context_menu(self, event, song, idx):
         menu = Menu(self.root, tearoff=0, bg=BG3, fg=TXT,
