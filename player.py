@@ -16,6 +16,10 @@ and emotion-tagging system stripped out. Everything else is kept:
 Install:
     pip install pygame-ce mutagen pillow numpy
 
+Optional — audio→lyrics transcription (the "wrong words? → transcribe" path):
+    pip install faster-whisper        # recommended: no ffmpeg/PyTorch needed
+    # (or)  pip install openai-whisper   # heavier; also needs ffmpeg on PATH
+
 (librosa is NOT required — this build does no acoustic analysis.)
 """
 
@@ -49,6 +53,27 @@ try:
     from PIL import Image, ImageTk; _PIL = True
 except ImportError:
     Image = ImageTk = None; _PIL = False
+
+# Optional local speech-to-text — transcribes a song's audio into lyrics when
+# the online words are wrong. Kept fully optional so the player runs without it.
+# Two backends are supported, tried in order of reliability:
+#   1. faster-whisper — decodes audio itself (PyAV), so NO system ffmpeg is
+#      needed and it doesn't pull in PyTorch. Best choice on Windows.
+#   2. openai-whisper — needs an ffmpeg binary on PATH and installs PyTorch.
+_TRANSCRIBE_BACKEND = None
+try:
+    from faster_whisper import WhisperModel as _FWModel
+    _TRANSCRIBE_BACKEND = "faster"
+except Exception:
+    _FWModel = None
+    try:
+        import whisper as _whisper        # openai-whisper
+        _TRANSCRIBE_BACKEND = "openai"
+    except Exception:
+        _whisper = None
+_WHISPER       = _TRANSCRIBE_BACKEND is not None
+_whisper_model = None                     # lazily loaded + cached across calls
+WHISPER_MODEL  = "small"                  # bigger than 'base' → better lyric accuracy
 
 # ── Data files (kept inside THIS folder — separate from Solace) ────────────────
 _DIR           = Path(__file__).parent
@@ -171,6 +196,25 @@ def _fmt_dur(sec):
     m, s = divmod(int(sec), 60); return f"{m}:{s:02d}"
 
 
+# Audio extensions recognised when scanning a folder / USB drive.
+AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus")
+
+
+def scan_folder_audio(folder: str) -> list:
+    """Recursively collect audio files under `folder` (e.g. a USB drive).
+    Returns a sorted list of absolute paths."""
+    found = []
+    try:
+        for root, _dirs, files in os.walk(folder):
+            for fn in files:
+                if fn.lower().endswith(AUDIO_EXTS):
+                    found.append(os.path.join(root, fn))
+    except Exception:
+        pass
+    found.sort()
+    return found
+
+
 # ==============================================================================
 #  LYRICS  (generation/lookup — lrclib primary, lyrics.ovh fallback)
 # ==============================================================================
@@ -185,18 +229,46 @@ def _clean_for_lyrics(s: str) -> str:
     return s.strip()
 
 
-def fetch_lyrics(title: str, artist: str = "") -> str:
-    """Fetch plain lyrics for a song in ANY language.
+def parse_lrc(text: str):
+    """Parse LRC-timestamped lyrics into a sorted [[seconds, line], ...] list.
+    Returns [] when there are no usable timestamps."""
+    if not text:
+        return []
+    out = []
+    tag_re = re.compile(r'\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]')
+    for raw in text.splitlines():
+        tags = tag_re.findall(raw)
+        if not tags:
+            continue
+        line = tag_re.sub('', raw).strip()
+        for mm, ss, frac in tags:
+            t = int(mm) * 60 + int(ss)
+            if frac:
+                t += int(frac) / (10 ** len(frac))
+            out.append([round(t, 2), line])
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def fetch_lyrics_full(title: str, artist: str = "") -> dict:
+    """Look up lyrics online, weighting the match toward the SONG NAME.
+
+    Returns {'plain': str, 'synced': [[t, line], ...] or None, 'source': str}.
+    'synced' carries per-line timestamps (LRC) when the provider has them —
+    that's what lets the lyrics scroll in time with the audio.
 
     Order:
-      1. lrclib /api/get    — exact artist+title (fast path)
-      2. lrclib /api/search — fuzzy ranked search (best for non-English /
-         romanised / loosely-tagged titles)
-      3. lyrics.ovh         — last-resort fallback
+      1. lrclib /api/get    — exact track (artist+title, then TITLE-ONLY so a
+                              strong song-name match still wins with bad tags)
+      2. lrclib /api/search — song-name-led fuzzy search; prefers a result
+                              whose track name matches and that has timings
+      3. lyrics.ovh         — last-resort plain-text fallback
     """
     title  = (title or "").strip()
     artist = (artist or "").strip()
-    if not title: return ""
+    empty  = {"plain": "", "synced": None, "source": ""}
+    if not title:
+        return empty
     ct, ca = _clean_for_lyrics(title), _clean_for_lyrics(artist)
     hdr = {"User-Agent": "CoolMP3/1.0 (https://example.com/coolmp3)"}
 
@@ -205,42 +277,60 @@ def fetch_lyrics(title: str, artist: str = "") -> str:
         with urllib.request.urlopen(req, timeout=9) as r:
             return json.loads(r.read())
 
-    # 1. lrclib exact get — try cleaned, then raw tags
-    for a, t in [(ca, ct), (artist, title)]:
-        if not t: continue
+    def _pack(rec, source):
+        plain  = (rec.get("plainLyrics") or "").strip()
+        synced = parse_lrc(rec.get("syncedLyrics") or "")
+        if not plain and synced:
+            plain = "\n".join(l for _t, l in synced)
+        return {"plain": plain, "synced": synced or None, "source": source}
+
+    # 1. lrclib exact GET — prioritise the song name (title-only included).
+    for a, t in [(ca, ct), (artist, title), ("", ct), ("", title)]:
+        if not t:
+            continue
         try:
             params = {"track_name": t}
-            if a: params["artist_name"] = a
-            data = _get_json("https://lrclib.net/api/get?" +
-                             urllib.parse.urlencode(params))
-            lyr = (data.get("plainLyrics") or "").strip()
-            if len(lyr) > 20:
-                return lyr
+            if a:
+                params["artist_name"] = a
+            res = _pack(_get_json("https://lrclib.net/api/get?" +
+                                  urllib.parse.urlencode(params)), "lrclib")
+            if len(res["plain"]) > 20:
+                return res
         except Exception:
             pass
 
-    # 2. lrclib fuzzy search — handles other languages & messy titles
+    # 2. lrclib fuzzy SEARCH — led by the song name.
     queries = []
-    if ca and ct: queries.append(f"{ct} {ca}")
-    queries.append(ct)
+    if ct:          queries.append(ct)              # song name first
+    if ct and ca:   queries.append(f"{ct} {ca}")
     if title != ct: queries.append(title)
-    seen_q = set()
+    seen_q, best = set(), None
     for q in queries:
         q = q.strip()
-        if not q or q.lower() in seen_q: continue
+        if not q or q.lower() in seen_q:
+            continue
         seen_q.add(q.lower())
         try:
             results = _get_json("https://lrclib.net/api/search?q=" +
                                 urllib.parse.quote(q))
-            if not isinstance(results, list): continue
-            for res in results:
-                lyr = (res.get("plainLyrics") or "").strip()
-                if len(lyr) > 20:
-                    return lyr
+            if not isinstance(results, list):
+                continue
+            for r in results:
+                rec = _pack(r, "lrclib")
+                if len(rec["plain"]) <= 20:
+                    continue
+                name_ok = ct.lower() in (r.get("trackName") or "").lower()
+                if name_ok and rec["synced"]:
+                    return rec                       # best case: name + timings
+                # Otherwise keep the strongest candidate (prefer one w/ timings).
+                if best is None or (rec["synced"] and not best["synced"]):
+                    best = rec
         except Exception:
             pass
+    if best:
+        return best
 
-    # 3. lyrics.ovh fallback
+    # 3. lyrics.ovh fallback (plain only)
     if ca and ct:
         try:
             url = (f"https://api.lyrics.ovh/v1/"
@@ -248,10 +338,65 @@ def fetch_lyrics(title: str, artist: str = "") -> str:
                    f"{urllib.parse.quote(ct, safe='')}")
             lyr = (_get_json(url).get("lyrics") or "").strip()
             if len(lyr) > 20:
-                return lyr
+                return {"plain": lyr, "synced": None, "source": "lyrics.ovh"}
         except Exception:
             pass
-    return ""
+    return empty
+
+
+def fetch_lyrics(title: str, artist: str = "") -> str:
+    """Backwards-compatible plain-text lyric lookup."""
+    return fetch_lyrics_full(title, artist)["plain"]
+
+
+def _load_whisper():
+    """Lazily load + cache the speech-to-text model (first call is slow)."""
+    global _whisper_model
+    if _whisper_model is None and _WHISPER:
+        if _TRANSCRIBE_BACKEND == "faster":
+            # int8 on CPU keeps memory + download small; no GPU required.
+            _whisper_model = _FWModel(WHISPER_MODEL, device="cpu",
+                                      compute_type="int8")
+        else:
+            _whisper_model = _whisper.load_model(WHISPER_MODEL)
+    return _whisper_model
+
+
+def transcribe_audio(path: str) -> dict:
+    """Transcribe a song's vocals to lyrics with a local Whisper model.
+
+    Returns {'plain': str, 'synced': [[t, line], ...] or None, 'error': str}.
+    The synced timings come from each segment's start time, so a transcript
+    still scrolls with the audio. On failure, 'error' explains why.
+    """
+    if not _WHISPER:
+        return {"plain": "", "synced": None,
+                "error": "no transcription backend installed"}
+    try:
+        model  = _load_whisper()
+        synced = []
+        if _TRANSCRIBE_BACKEND == "faster":
+            # vad_filter skips silence/instrumental gaps; language auto-detects.
+            segments, _info = model.transcribe(
+                path, vad_filter=True, beam_size=5,
+                initial_prompt="Song lyrics:")
+            for seg in segments:                  # generator — runs the decode
+                line = (seg.text or "").strip()
+                if line:
+                    synced.append([round(float(seg.start), 2), line])
+        else:
+            # condition_on_previous_text=False stops Whisper looping a hook.
+            result = model.transcribe(path, fp16=False, verbose=False,
+                                      condition_on_previous_text=False,
+                                      initial_prompt="Song lyrics:")
+            for seg in result.get("segments", []):
+                line = (seg.get("text") or "").strip()
+                if line:
+                    synced.append([round(float(seg.get("start", 0.0)), 2), line])
+        plain = "\n".join(l for _t, l in synced)
+        return {"plain": plain, "synced": synced or None, "error": ""}
+    except Exception as e:
+        return {"plain": "", "synced": None, "error": f"{type(e).__name__}: {e}"}
 
 
 def load_lyrics_db() -> dict:
@@ -511,6 +656,18 @@ class NowPlayingOverlay(Frame):
         self._cover_cache: dict = {}
         self._last_song      = None
         self._lyrics_editing = False
+        # Time-synced ("karaoke") lyrics state
+        self._synced        = None    # [[t, line], ...] for current song, or None
+        self._synced_song   = None    # path the loaded synced data belongs to
+        self._active_lyr_ln = -1      # currently-highlighted lyric line (1-based)
+        self._lyr_attempts  = {}      # per-path: how many times Generate was used
+        self._lyr_busy      = False   # a lookup / transcription is in flight
+        # Manual-scroll override: when the user scrolls the lyrics, auto-scroll
+        # pauses for a grace period, then resumes from where they left off.
+        self._lyr_user_scroll_at  = 0.0    # time of the user's last scroll gesture
+        self._lyr_scroll_offset   = -0.08  # proportional-mode offset (view top vs time)
+        self._lyr_resume_grace    = 4.0    # seconds of no input before auto resumes
+        self._lyr_was_user_scroll = False  # were we paused for the user last tick?
         # Visualizer state
         self._vis_on    = False
         self._vis_cv    = None
@@ -791,6 +948,16 @@ class NowPlayingOverlay(Frame):
         sb.config(command=self._lyr_txt.yview)
         sb.pack(side=RIGHT, fill=Y)
         self._lyr_txt.pack(side=LEFT, fill=BOTH, expand=True)
+        # "active" = the line currently being sung (synced lyrics); "dim" = the rest.
+        self._lyr_txt.tag_configure("active", foreground=ACCENT_HI,
+                                    font=(FF, 13, "bold"))
+        self._lyr_txt.tag_configure("dim", foreground=TXT_MID)
+        # Detect manual scrolling so auto-scroll can yield, then resume.
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>",
+                    "<Up>", "<Down>", "<Prior>", "<Next>"):
+            self._lyr_txt.bind(seq, self._on_user_lyric_scroll, add="+")
+        sb.bind("<Button-1>",  self._on_user_lyric_scroll, add="+")
+        sb.bind("<B1-Motion>", self._on_user_lyric_scroll, add="+")
 
     def _build_queue_panel(self):
         f = Frame(self._fs_content, bg=BG)
@@ -968,6 +1135,11 @@ class NowPlayingOverlay(Frame):
         self.app.lyrics_db[song.path] = {"lyrics": text, "source": "user"}
         save_lyrics_db(self.app.lyrics_db)
         self.app._uq.put(song)
+        # Hand-edited lyrics no longer line up with old timings — drop them and
+        # fall back to proportional scrolling for this song.
+        self._synced = None
+        self._synced_song = song.path
+        self._active_lyr_ln = -1
         self._lyrics_editing = False
         self._lyr_txt.config(state=DISABLED)
         self._lyr_edit_btn.config(text="✏ Edit", fg=TXT_MID)
@@ -976,43 +1148,203 @@ class NowPlayingOverlay(Frame):
 
     def _set_lyrics_text(self, text: str):
         self._lyr_txt.config(state=NORMAL)
+        self._lyr_txt.tag_remove("active", "1.0", END)
         self._lyr_txt.delete("1.0", END)
         placeholder = ("No lyrics yet.\n\n"
-                       "Click  🔍 Generate  to look them up (works for other\n"
-                       "languages too), or  ✏ Edit  to add them manually.")
+                       "Click  🔍 Generate  to look them up online (works for\n"
+                       "other languages too). If the words are WRONG, click\n"
+                       "Generate again to transcribe them straight from the\n"
+                       "audio — or use  ✏ Edit  to add them manually.")
         self._lyr_txt.insert("1.0", text if text else placeholder)
         if not self._lyrics_editing:
             self._lyr_txt.config(state=DISABLED)
+        self._active_lyr_ln = -1
 
+    # ── Synced (karaoke) lyric scrolling ───────────────────────────────────────
+    def _load_synced(self, song):
+        """Pull any line-timed lyrics for `song` from the DB into local state."""
+        entry  = self.app.lyrics_db.get(song.path, {}) if song else {}
+        synced = entry.get("synced")
+        self._synced = ([[float(t), str(txt)] for t, txt in synced]
+                        if synced else None)
+        self._synced_song   = song.path if song else None
+        self._active_lyr_ln = -1
+        # Fresh song → clear any manual-scroll override from the previous one.
+        self._lyr_user_scroll_at  = 0.0
+        self._lyr_scroll_offset   = -0.08
+        self._lyr_was_user_scroll = False
+
+    def _on_user_lyric_scroll(self, _e=None):
+        """User scrolled the lyrics by hand — pause auto-scroll, note the time."""
+        self._lyr_user_scroll_at = time.time()
+        # Let the widget's own (default) scrolling proceed.
+        return None
+
+    def _refresh_lyrics_display(self, song):
+        """Show the lyrics for `song`. When synced timings exist, render those
+        exact lines so highlighting maps 1:1 to the timestamps."""
+        self._load_synced(song)
+        if self._synced:
+            text = "\n".join(txt for _t, txt in self._synced)
+        else:
+            text = (self.app.lyrics_db.get(song.path, {}).get("lyrics", "")
+                    if song else "")
+        self._set_lyrics_text(text)
+
+    def _highlight_line(self, ln: int, scroll: bool = True):
+        txt = self._lyr_txt
+        try:
+            txt.tag_remove("active", "1.0", END)
+            txt.tag_add("active", f"{ln}.0", f"{ln}.end")
+            if scroll:
+                # Keep the active line roughly centred (≈6 lines from the top).
+                txt.yview(f"{max(1, ln - 6)}.0")
+        except Exception:
+            pass
+
+    def _update_lyric_scroll(self):
+        """Each tick: highlight the line being sung (synced) or glide-scroll the
+        plain lyrics proportionally to playback position.
+
+        If the user has scrolled by hand recently, auto-scroll yields for a
+        grace period and then resumes from where they left it: synced lyrics
+        re-centre on the current line; proportional lyrics carry the user's
+        correction forward as an offset (fixes 'scrolled too fast/slow')."""
+        app = self.app
+        if self._lyrics_editing:
+            return
+        song = self._current_song()
+        if not song or not app._playing or app._song_dur <= 0:
+            return
+        pos = min(time.time() - app._play_start, app._song_dur)
+        user_active = (time.time() - self._lyr_user_scroll_at) < self._lyr_resume_grace
+
+        if self._synced:
+            idx = -1
+            for i, (t, _txt) in enumerate(self._synced):
+                if t <= pos + 0.2:
+                    idx = i
+                else:
+                    break
+            if idx < 0:
+                return
+            ln = idx + 1                       # synced lines map 1:1 to Text lines
+            if ln != self._active_lyr_ln:
+                # Always recolour the sung line; only auto-scroll when the user
+                # isn't currently in control.
+                self._highlight_line(ln, scroll=not user_active)
+                self._active_lyr_ln = ln
+            elif self._lyr_was_user_scroll and not user_active:
+                # Grace just elapsed on a held line → re-centre once.
+                self._highlight_line(ln, scroll=True)
+        else:
+            cur = self._lyr_txt.get("1.0", "end-1c")
+            if not cur or "No lyrics" in cur:
+                self._lyr_was_user_scroll = user_active
+                return
+            base = pos / app._song_dur
+            if user_active:
+                # Track where the user parked the view, relative to playback,
+                # so auto-scroll can continue from there once they stop.
+                try:
+                    self._lyr_scroll_offset = self._lyr_txt.yview()[0] - base
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._lyr_txt.yview_moveto(
+                        max(0.0, min(1.0, base + self._lyr_scroll_offset)))
+                except Exception:
+                    pass
+
+        self._lyr_was_user_scroll = user_active
+
+    def _update_gen_btn(self, song):
+        """Generate button hints the next action: online first, audio after."""
+        if self._lyr_busy:
+            return
+        attempts = self._lyr_attempts.get(song.path, 0) if song else 0
+        try:
+            self._lyr_fetch_btn.config(
+                text=("🎙 From Audio" if attempts >= 1 else "🔍 Generate"),
+                state=NORMAL)
+        except Exception:
+            pass
+
+    # ── Lyric generation: online first, audio transcription on "wrong → again" ──
     def _fetch_lyrics_now(self):
         song = self._current_song()
         if not song:
             self.app._status.set("Nothing playing — start a song first"); return
-        if self._lyrics_editing:
+        if self._lyrics_editing or self._lyr_busy:
             return
-        self._lyr_fetch_btn.config(text="… searching", state=DISABLED)
-        self.app._status.set(f"🔍 Generating lyrics for '{song.title or song.name}'…")
-        threading.Thread(target=self._fetch_lyrics_bg, args=(song,),
-                         daemon=True).start()
+        if self._lyr_attempts.get(song.path, 0) == 0:
+            # First attempt → online lookup, weighted to the song name.
+            self._lyr_attempts[song.path] = 1
+            self._lyr_busy = True
+            self._lyr_fetch_btn.config(text="… searching", state=DISABLED)
+            self.app._status.set(
+                f"🔍 Searching online for '{song.title or song.name}'…")
+            threading.Thread(target=self._fetch_lyrics_bg, args=(song,),
+                             daemon=True).start()
+        else:
+            # Asked again → online words were wrong: transcribe the audio.
+            self._start_transcription(song)
 
     def _fetch_lyrics_bg(self, song):
-        lyrics = fetch_lyrics(song.title or song.name, song.artist)
-        self.app.root.after(0, lambda: self._fetch_lyrics_done(song, lyrics))
+        res = fetch_lyrics_full(song.title or song.name, song.artist)
+        self.app.root.after(0, lambda: self._fetch_lyrics_done(song, res))
 
-    def _fetch_lyrics_done(self, song, lyrics):
-        try: self._lyr_fetch_btn.config(text="🔍 Generate", state=NORMAL)
-        except Exception: pass
-        if lyrics:
-            self.app.lyrics_db[song.path] = {"lyrics": lyrics, "source": "auto"}
-            save_lyrics_db(self.app.lyrics_db)
-            self.app._uq.put(song)
+    def _fetch_lyrics_done(self, song, res):
+        self._lyr_busy = False
+        plain = res.get("plain", "")
+        if plain:
+            self.app._store_lyrics(song, plain, res.get("synced"),
+                                   res.get("source") or "auto")
             if song is self._current_song() and not self._lyrics_editing:
-                self._set_lyrics_text(lyrics)
-            self.app._status.set(f"♪ Lyrics found for '{song.title or song.name}'")
+                self._refresh_lyrics_display(song)
+            self.app._status.set(
+                f"♪ Lyrics found for '{song.title or song.name}'  ·  "
+                f"wrong words? click Generate again to transcribe the audio")
         else:
             self.app._status.set(
-                f"No lyrics found for '{song.title or song.name}'  ·  "
-                f"try  ✏ Edit  to add them manually")
+                f"No online lyrics for '{song.title or song.name}'  ·  "
+                f"click Generate again to transcribe directly from the audio")
+        self._update_gen_btn(self._current_song())
+
+    def _start_transcription(self, song):
+        if not _WHISPER:
+            self.app._status.set(
+                "Audio transcription needs a backend  ·  "
+                "pip install faster-whisper  (recommended — no ffmpeg needed)")
+            return
+        self._lyr_attempts[song.path] = self._lyr_attempts.get(song.path, 1) + 1
+        self._lyr_busy = True
+        self._lyr_fetch_btn.config(text="… listening", state=DISABLED)
+        self.app._status.set(
+            f"🎙 Transcribing '{song.title or song.name}' from audio  ·  "
+            f"first run loads the model, please wait…")
+        threading.Thread(target=self._transcribe_bg, args=(song,),
+                         daemon=True).start()
+
+    def _transcribe_bg(self, song):
+        res = transcribe_audio(song.path)
+        self.app.root.after(0, lambda: self._transcribe_done(song, res))
+
+    def _transcribe_done(self, song, res):
+        self._lyr_busy = False
+        plain = res.get("plain", "")
+        if plain:
+            self.app._store_lyrics(song, plain, res.get("synced"), "transcribed")
+            if song is self._current_song() and not self._lyrics_editing:
+                self._refresh_lyrics_display(song)
+            self.app._status.set(
+                f"🎙 Transcribed '{song.title or song.name}' from the audio")
+        else:
+            err = res.get("error") or "unknown error"
+            self.app._status.set(f"Transcription failed — {err}")
+        try: self._lyr_fetch_btn.config(text="🎙 From Audio", state=NORMAL)
+        except Exception: pass
 
     # ── Seeking ────────────────────────────────────────────────────────────────
     def _fs_seek(self, event, cv, fill, dot):
@@ -1908,21 +2240,29 @@ class NowPlayingOverlay(Frame):
             if song:
                 self._now_name2.set((song.title or song.name)[:60])
                 self._now_art2.set(song.artist or "")
-                lyr = app.lyrics_db.get(song.path, {}).get("lyrics", "")
-                self._set_lyrics_text(lyr)
+                self._refresh_lyrics_display(song)
+                self._update_gen_btn(song)
                 threading.Thread(target=self._load_cover_bg,
                                  args=(song,), daemon=True).start()
             else:
                 self._now_name2.set("Nothing playing")
                 self._now_art2.set("")
+                self._synced = None; self._synced_song = None
                 self._set_lyrics_text("")
                 self._cover_lbl.config(image="", text="♪", font=(FF, 60), fg=TXT_DIM)
 
         if song and not self._lyrics_editing:
-            new_lyr = app.lyrics_db.get(song.path, {}).get("lyrics", "")
+            entry   = app.lyrics_db.get(song.path, {})
+            db_lyr  = entry.get("lyrics", "")
             cur_txt = self._lyr_txt.get("1.0", "end-1c")
-            if new_lyr and "No lyrics" in cur_txt:
-                self._set_lyrics_text(new_lyr)
+            # Lyrics arrived (background lookup) or synced timings just appeared.
+            if (db_lyr and "No lyrics" in cur_txt) or \
+               (entry.get("synced") and self._synced is None
+                and self._synced_song == song.path):
+                self._refresh_lyrics_display(song)
+
+        # Scroll / highlight lyrics in time with the audio.
+        self._update_lyric_scroll()
 
         self._fs_play_btn.config(text="⏸" if app._playing else "▶")
         rep_icons = {0: ("🔁", TXT_DIM), 1: ("🔂", ACCENT), 2: ("🔁", ACCENT)}
@@ -2117,6 +2457,10 @@ class PlayerApp:
                relief=FLAT, cursor="hand2", padx=14, pady=7,
                activebackground=ACCENT_DK, activeforeground=WHITE,
                command=self._upload).pack(side=RIGHT, padx=(6, 0))
+        Button(bar, text="📁  Import Folder", font=(FF, 10, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=self._import_folder).pack(side=RIGHT, padx=(6, 0))
         Button(bar, text="🔀  Shuffle All", font=(FF, 10, "bold"), bg=BG3, fg=TXT,
                relief=FLAT, cursor="hand2", padx=14, pady=7,
                activebackground=BG4, activeforeground=ACCENT,
@@ -2398,11 +2742,10 @@ class PlayerApp:
                 continue
             self.root.after(0, lambda i=i, s=song: self._status.set(
                 f"♪ Generating lyrics {i}/{total}: {s.title or s.name}…"))
-            lyrics = fetch_lyrics(song.title or song.name, song.artist)
-            if lyrics:
-                self.lyrics_db[song.path] = {"lyrics": lyrics, "source": "auto"}
-                save_lyrics_db(self.lyrics_db)
-                self._uq.put(song)
+            res = fetch_lyrics_full(song.title or song.name, song.artist)
+            if res["plain"]:
+                self._store_lyrics(song, res["plain"], res.get("synced"),
+                                   res.get("source") or "auto")
                 found += 1
             time.sleep(0.4)   # be polite to the free lyrics APIs
         self.root.after(0, lambda: self._generate_all_lyrics_done(found, total))
@@ -2876,6 +3219,134 @@ class PlayerApp:
             self._render_library()
             self._status.set(f"Added {added} songs  ·  looking up cover art + lyrics…")
 
+    # ── Import a whole folder / USB drive ──────────────────────────────────────
+    def _import_folder(self):
+        """Read every audio file in a chosen folder (e.g. a USB stick) and let
+        the user save them as a separate playlist or add them to the Library."""
+        folder = filedialog.askdirectory(
+            title="Select a folder or USB drive of audio files")
+        if not folder:
+            return
+        self._status.set("Scanning folder for audio files…")
+        paths = scan_folder_audio(folder)
+        if not paths:
+            messagebox.showinfo("Cool MP3 Player",
+                                "No audio files were found in that folder.")
+            self._status.set("Ready")
+            return
+        folder_name = os.path.basename(folder.rstrip("/\\")) or folder
+        dest = self._ask_import_destination(len(paths), folder_name)
+        if dest is None:
+            self._status.set("Folder import cancelled")
+            return
+        if dest == "library":
+            self._import_folder_to_library(paths)
+        else:
+            name = simpledialog.askstring(
+                "Save as Playlist", "Playlist name:",
+                initialvalue=folder_name, parent=self.root)
+            if not name or not name.strip():
+                self._status.set("Folder import cancelled")
+                return
+            self._import_folder_to_playlist(paths, name.strip())
+
+    def _ask_import_destination(self, count: int, folder_name: str):
+        """Modal asking whether a folder import should become a separate
+        playlist or join the main Library. Returns 'playlist', 'library', or
+        None if cancelled."""
+        win = Toplevel(self.root)
+        win.title("Import Folder")
+        win.configure(bg=BG2)
+        win.resizable(False, False)
+        win.transient(self.root)
+        result = {"v": None}
+
+        Label(win, text=f"Found {count} audio file{'s' if count != 1 else ''} in",
+              font=(FF, 11), bg=BG2, fg=TXT).pack(padx=28, pady=(22, 2))
+        Label(win, text=folder_name, font=(FF, 12, "bold"),
+              bg=BG2, fg=ACCENT, wraplength=360).pack(padx=28, pady=(0, 6))
+        Label(win, text="How would you like to import them?",
+              font=(FF, 10), bg=BG2, fg=TXT_MID).pack(padx=28, pady=(0, 18))
+
+        btns = Frame(win, bg=BG2); btns.pack(padx=28, pady=(0, 22))
+
+        def choose(v):
+            result["v"] = v
+            win.destroy()
+
+        Button(btns, text="📁  Save as separate playlist", font=(FF, 10, "bold"),
+               bg=ACCENT, fg=WHITE, relief=FLAT, cursor="hand2", padx=14, pady=8,
+               activebackground=ACCENT_DK, activeforeground=WHITE,
+               command=lambda: choose("playlist")).pack(fill=X, pady=(0, 8))
+        Button(btns, text="🎵  Add to main Library", font=(FF, 10, "bold"),
+               bg=BG3, fg=TXT, relief=FLAT, cursor="hand2", padx=14, pady=8,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda: choose("library")).pack(fill=X, pady=(0, 8))
+        Button(btns, text="Cancel", font=(FF, 10), bg=BG4, fg=TXT_DIM,
+               relief=FLAT, cursor="hand2", padx=14, pady=6,
+               activebackground=BG3, activeforeground=TXT,
+               command=lambda: choose(None)).pack(fill=X)
+
+        # Centre over the main window.
+        win.update_idletasks()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        ww, wh = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{rx + (rw - ww) // 2}+{ry + (rh - wh) // 2}")
+        win.grab_set()
+        win.wait_window()
+        return result["v"]
+
+    def _import_folder_to_library(self, paths):
+        existing = {s.path for s in self.songs}; added = 0
+        for p in paths:
+            if p not in existing:
+                song = Song(p); self.songs.append(song)
+                self._mq.put(song); added += 1
+        if added:
+            save_library(self.songs)
+            self._render_library()
+            self._status.set(f"Imported {added} songs into your Library  ·  "
+                             f"looking up cover art + lyrics…")
+        else:
+            self._status.set("Those songs are already in your Library")
+
+    def _import_folder_to_playlist(self, paths, name: str):
+        """Build a playlist straight from the folder WITHOUT touching the
+        Library. Metadata is read on a background thread to keep the UI live."""
+        self._status.set(f"Reading {len(paths)} files for playlist '{name}'…")
+        threading.Thread(target=self._build_folder_playlist,
+                         args=(list(paths), name), daemon=True).start()
+
+    def _build_folder_playlist(self, paths, name: str):
+        entries = []
+        for p in paths:
+            try:
+                entries.append(self._song_entry(Song(p)))
+            except Exception:
+                pass
+        self.root.after(0, lambda: self._finish_folder_playlist(entries, name))
+
+    def _finish_folder_playlist(self, entries, name: str):
+        pl = {"id": str(uuid.uuid4()), "name": name,
+              "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+              "songs": entries, "source": "folder"}
+        self.playlists.append(pl)
+        save_playlists(self.playlists)
+        if self._active_tab == "Playlists":
+            self._render_playlists_tab()
+        self._status.set(f"Saved folder as playlist '{name}'  ·  "
+                         f"{len(entries)} songs (not added to your Library)")
+
+    def _store_lyrics(self, song, plain, synced=None, source="auto"):
+        """Persist a lyric result (plus optional line timings) for `song`."""
+        entry = {"lyrics": plain, "source": source}
+        if synced:
+            entry["synced"] = synced
+        self.lyrics_db[song.path] = entry
+        save_lyrics_db(self.lyrics_db)
+        self._uq.put(song)
+
     def _start_workers(self):
         threading.Thread(target=self._metadata_worker, daemon=True).start()
 
@@ -2892,11 +3363,10 @@ class PlayerApp:
                     self._uq.put(song)
 
             if song.path not in self.lyrics_db or not self.lyrics_db[song.path].get("lyrics"):
-                lyrics = fetch_lyrics(title, artist)
-                if lyrics:
-                    self.lyrics_db[song.path] = {"lyrics": lyrics, "source": "auto"}
-                    save_lyrics_db(self.lyrics_db)
-                    self._uq.put(song)
+                res = fetch_lyrics_full(title, artist)
+                if res["plain"]:
+                    self._store_lyrics(song, res["plain"], res.get("synced"),
+                                       res.get("source") or "auto")
 
             time.sleep(0.4)   # be polite to the free APIs
 
