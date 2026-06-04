@@ -3720,7 +3720,16 @@ class PlayerApp:
 
 
 # ==============================================================================
+# Bump this for each release; the update check compares it to the latest
+# GitHub release tag (e.g. tag "v1.0.1" > APP_VERSION "1.0.0").
+APP_VERSION = "1.0.0"
+
 if __name__ == "__main__":
     root = Tk()
     PlayerApp(root)
+    try:
+        from updatecheck import check_for_updates
+        check_for_updates(root, "Watifs/cool-mp3-player", APP_VERSION, "Cool MP3 Player")
+    except Exception:
+        pass  # update check is best-effort; never block startup
     root.mainloop()

@@ -1,0 +1,58 @@
+name: release
+
+# On every version tag (e.g. v1.0.1) build the Windows .exe and the macOS .app,
+# then publish them to a permanent GitHub Release. Shipping an update = bump
+# APP_VERSION in player.py, commit, then push a matching tag:
+#     git tag v1.0.1 && git push origin v1.0.1
+# Installed copies notice the newer release on next launch and offer to open the
+# download page (see updatecheck.py).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for softprops to create/update the Release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pygame Pillow mutagen numpy
+      - name: Build Cool MP3 Player.exe
+        run: python -m PyInstaller --noconfirm --distpath "dist/windows" --workpath "build/windows" "packaging/windows/cool_mp3_player.spec"
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/windows/Cool MP3 Player.exe
+          fail_on_unmatched_files: true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pygame Pillow mutagen numpy
+      - name: Build Cool MP3 Player.app
+        run: python -m PyInstaller --noconfirm --distpath "dist/macos" --workpath "build/macos" "packaging/macos/cool_mp3_player.spec"
+      - name: Zip the .app bundle
+        run: |
+          cd "dist/macos"
+          ditto -c -k --sequesterRsrc --keepParent "Cool MP3 Player.app" "Cool-MP3-Player-mac.zip"
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/macos/Cool-MP3-Player-mac.zip
+          fail_on_unmatched_files: true
