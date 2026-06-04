@@ -1,0 +1,45 @@
+name: mac-build
+
+# Builds the macOS .app bundle with PyInstaller, zips it, and uploads the
+# zip as a downloadable artifact on every push to main.
+# (Cool MP3 Player is a Python app, so this uses Python/PyInstaller rather
+# than Node — it mirrors packaging/macos/build.command.)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Lean profile — same set build.command installs (no PyTorch/Demucs).
+          pip install pyinstaller pygame Pillow mutagen numpy
+
+      - name: Build Cool MP3 Player.app
+        run: |
+          python -m PyInstaller --noconfirm \
+            --distpath "dist/macos" \
+            --workpath "build/macos" \
+            "packaging/macos/cool_mp3_player.spec"
+
+      - name: Zip the .app bundle
+        run: |
+          cd "dist/macos"
+          ditto -c -k --sequesterRsrc --keepParent "Cool MP3 Player.app" "Cool-MP3-Player-mac.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: dist/macos/Cool-MP3-Player-mac.zip
+          if-no-files-found: error
