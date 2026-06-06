@@ -32,7 +32,9 @@ python3 -m venv "$VENV"
 # shellcheck disable=SC1090
 source "$VENV/bin/activate"
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller pygame Pillow mutagen numpy
+# pygame-ce ships prebuilt wheels (incl. newer Pythons) and provides the same
+# `import pygame` the app uses; plain "pygame" can fail to build from source.
+python -m pip install --quiet pyinstaller pygame-ce Pillow mutagen numpy
 
 # 3. Build the .app bundle from the spec.
 echo "→  Building Cool MP3 Player.app ..."

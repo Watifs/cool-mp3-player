@@ -8,8 +8,11 @@ Set-Location $root
 Write-Host "Project root: $root" -ForegroundColor Cyan
 
 # 1. Make sure the build tools + lean runtime deps are present.
+#    Use pygame-ce (prebuilt wheels, incl. Python 3.13/3.14) — plain "pygame"
+#    tries to compile from source on newer Pythons and fails. It provides the
+#    same `import pygame` the app uses.
 Write-Host "Installing build dependencies..." -ForegroundColor Cyan
-python -m pip install --quiet --upgrade pyinstaller pygame Pillow mutagen numpy
+python -m pip install --quiet --upgrade pyinstaller pygame-ce Pillow mutagen numpy
 
 # 2. Build using the spec. Artifact lands directly in dist\windows.
 Write-Host "Building Cool MP3 Player.exe ..." -ForegroundColor Cyan

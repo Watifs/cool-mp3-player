@@ -40,6 +40,43 @@ pip install pygame-ce mutagen pillow numpy
 python player.py
 ```
 
+## Download (Windows installer)
+
+Grab **`Cool MP3 Player Setup.exe`** from the
+[Releases page](https://github.com/Watifs/cool-mp3-player/releases/latest) and run it.
+
+- It installs per-user (no admin prompt) to
+  `…\AppData\Local\Programs\Cool MP3 Player`, with Start-Menu (and optional
+  desktop) shortcuts, and an entry in **Settings ▸ Apps**.
+- **It auto-updates an existing install.** Run a newer installer and it detects
+  the version already on the PC, closes the app if it's running, and **upgrades
+  it in place** — no second copy, no manual uninstall. (It also warns before a
+  downgrade, and asks before reinstalling the same version.)
+- The app still checks GitHub on startup and offers to open the Releases page
+  when a newer version is published — download that installer and run it to update.
+
+On **macOS**, open the `.dmg` and drag the app to **Applications**; if a copy is
+already there, Finder offers to **Replace** it (that's the macOS-native "update").
+
+## Building it yourself
+
+```powershell
+# Windows — builds dist\windows\Cool MP3 Player.exe
+pwsh packaging\windows\build.ps1
+
+# Windows — builds the installer dist\windows\Cool MP3 Player Setup.exe
+#   (needs Inno Setup 6:  winget install --id JRSoftware.InnoSetup -e)
+pwsh packaging\windows\build-installer.ps1
+```
+
+```bash
+# macOS — builds dist/macos/Cool MP3 Player.app + .dmg
+bash packaging/macos/build.command
+```
+
+The installer's version is read automatically from `APP_VERSION` in `player.py`,
+so bump that before cutting a release.
+
 ## Keyboard shortcuts
 
 | Key | Action |
