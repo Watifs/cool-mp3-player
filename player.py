@@ -8,6 +8,8 @@ and emotion-tagging system stripped out. Everything else is kept:
   • Library — add songs, search, sort, queue, delete
   • Saved playlists
   • Full-screen "Now Playing" player (lyrics + up-next queue)
+  • Pop-out lyrics window — auto-scrolls + highlights the line being sung,
+    so karaoke lyrics stay readable while the visualizer is up.
   • Lyrics generation  — lrclib.net (primary) + lyrics.ovh (fallback)
   • Cover art           — embedded ID3 art or iTunes API thumbnail
   • NEW: live audio VISUALIZER — a real-FFT spectrum that reacts to the song,
@@ -31,6 +33,7 @@ import urllib.request, urllib.parse
 from pathlib import Path
 from tkinter import *
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 import numpy as np
 
 # ── DPI awareness ─────────────────────────────────────────────────────────────
@@ -238,6 +241,10 @@ def scan_folder_audio(folder: str) -> list:
     try:
         for root, _dirs, files in os.walk(folder):
             for fn in files:
+                # Skip macOS AppleDouble / resource-fork sidecars ("._song.mp3")
+                # and other dot-files — they aren't real audio and crash playback.
+                if fn.startswith("._") or fn.startswith("."):
+                    continue
                 if fn.lower().endswith(AUDIO_EXTS):
                     found.append(os.path.join(root, fn))
     except Exception:
@@ -751,8 +758,22 @@ def save_playlists(pls):
 def load_playlists():
     if not PLAYLISTS_FILE.exists(): return []
     try:
-        with open(PLAYLISTS_FILE, encoding="utf-8") as f: return json.load(f)
-    except Exception: return []
+        with open(PLAYLISTS_FILE, encoding="utf-8") as f: pls = json.load(f)
+    except Exception:
+        return []
+    # One-time cleanup: drop macOS AppleDouble junk entries ("._song.mp3") that
+    # older folder imports saved. They have no real audio and break playback.
+    changed = False
+    for pl in pls:
+        songs = pl.get("songs", [])
+        clean = [s for s in songs
+                 if not os.path.basename(s.get("path", "")).startswith("._")]
+        if len(clean) != len(songs):
+            pl["songs"] = clean
+            changed = True
+    if changed:
+        save_playlists(pls)
+    return pls
 
 
 # ==============================================================================
@@ -946,6 +967,7 @@ class NowPlayingOverlay(Frame):
                            "Warp", "Tunnel", "Disco", "Floor", "GIF"]
         self._vis_mode  = 0
         self._vis_hotspots = []       # on-canvas (x0,y0,x1,y1,action) controls
+        self._vis_pp_item  = None     # canvas id of the play/pause glyph
         # Color themes — (lo → hi) gradient; "rainbow" maps hue across bars;
         # "cycle" continuously shifts the whole visualizer through the spectrum.
         self._vis_themes = [
@@ -1058,6 +1080,14 @@ class NowPlayingOverlay(Frame):
                                activeforeground=WHITE,
                                command=self._toggle_visualizer)
         self._vis_btn.pack(side=RIGHT)
+        # Pop the lyrics out into their own auto-scrolling window — stays
+        # readable even when the visualizer covers this panel.
+        self._popout_btn = Button(hdr, text="⧉  Lyrics Window", font=(FF, 10, "bold"),
+                               bg=BG3, fg=TXT_MID, relief=FLAT, cursor="hand2",
+                               padx=12, pady=4, activebackground=BG3,
+                               activeforeground=ACCENT,
+                               command=self.app._toggle_lyrics_window)
+        self._popout_btn.pack(side=RIGHT, padx=(0, 8))
         # Cycle between visualizer styles (Bars / Mirror / Wave / Radial)
         self._vis_style_btn = Button(hdr, text="◑  " + self._vis_modes[self._vis_mode],
                                font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID, relief=FLAT,
@@ -1977,7 +2007,8 @@ class NowPlayingOverlay(Frame):
         self._vis_hotspots = []
         chips = [("◑  " + mode,                              "style"),
                  ("🎨  " + self._vis_themes[self._vis_theme]["name"], "theme"),
-                 ("🌈  BG " + ("On" if self._bg_cycle else "Off"), "bg")]
+                 ("🌈  BG " + ("On" if self._bg_cycle else "Off"), "bg"),
+                 ("⧉  Lyrics",                                "lyrics")]
         if mode == "GIF":
             chips.append(("📁  GIF…", "gif"))
         chips.append(("✕  Close", "close"))
@@ -1987,7 +2018,35 @@ class NowPlayingOverlay(Frame):
         # Song title — centered, sitting clearly below the control row.
         self._vis_title = cv.create_text(
             w // 2, 70, text="", fill=TXT, font=(FF, 16, "bold"))
+        # Transport controls — prev / play-pause / next, pinned bottom-centre.
+        self._vis_draw_transport(cv, w, h)
         self._vis_built = True
+
+    def _vis_draw_transport(self, cv, w, h):
+        """Draw prev / play-pause / next buttons centred along the bottom so the
+        user can control playback without leaving the visualizer."""
+        app = self.app
+        self._vis_pp_item = None
+        cy = h - 48
+        specs = [("⏮", "prev"),
+                 ("⏸" if app._playing else "▶", "playpause"),
+                 ("⏭", "next")]
+        bw, bh, gap = 64, 44, 16
+        total = len(specs) * bw + (len(specs) - 1) * gap
+        x = (w - total) // 2
+        for glyph, action in specs:
+            big = (action == "playpause")
+            x0, y0, x1, y1 = x, cy - bh // 2, x + bw, cy + bh // 2
+            cv.create_rectangle(x0, y0, x1, y1, fill=BG3, outline=BORDER,
+                                width=1, tags="transport")
+            tid = cv.create_text((x0 + x1) // 2, cy, text=glyph,
+                                 fill=ACCENT if big else TXT,
+                                 font=(FF, 20 if big else 16, "bold"),
+                                 tags="transport")
+            self._vis_hotspots.append((x0, y0, x1, y1, action))
+            if big:
+                self._vis_pp_item = tid
+            x += bw + gap
 
     def _vis_chip(self, cv, x, y, label, action):
         """Draw a small clickable control chip; record its hotspot. Returns the
@@ -2020,6 +2079,14 @@ class NowPlayingOverlay(Frame):
                           text=(song.title or song.name) if song else "Nothing playing")
         except Exception:
             pass
+
+        # Keep the play/pause glyph in sync and the transport controls on top
+        # of any per-frame visuals drawn over them.
+        if self._vis_pp_item is not None:
+            try: cv.itemconfig(self._vis_pp_item, text="⏸" if app._playing else "▶")
+            except Exception: pass
+        try: cv.tag_raise("transport")
+        except Exception: pass
 
         # Advance the color phase so the "Cycle" theme drifts through the
         # spectrum (~2.8s per full loop at 30fps).
@@ -2145,11 +2212,15 @@ class NowPlayingOverlay(Frame):
     def _vis_click(self, event):
         for x0, y0, x1, y1, action in self._vis_hotspots:
             if x0 <= event.x <= x1 and y0 <= event.y <= y1:
-                if   action == "style": self._cycle_vis_mode()
-                elif action == "theme": self._cycle_vis_theme()
-                elif action == "bg":    self._toggle_bg_cycle()
-                elif action == "gif":   self._load_gif()
-                else:                   self._toggle_visualizer()
+                if   action == "style":     self._cycle_vis_mode()
+                elif action == "theme":     self._cycle_vis_theme()
+                elif action == "bg":        self._toggle_bg_cycle()
+                elif action == "gif":       self._load_gif()
+                elif action == "lyrics":    self.app._toggle_lyrics_window()
+                elif action == "prev":      self.app._prev_song()
+                elif action == "playpause": self.app._toggle_play()
+                elif action == "next":      self.app._next_song()
+                else:                       self._toggle_visualizer()
                 return
         self._toggle_visualizer()          # click anywhere else closes
 
@@ -2622,6 +2693,323 @@ class NowPlayingOverlay(Frame):
 
 
 # ==============================================================================
+#  POP-OUT LYRICS WINDOW  (separate karaoke window — auto-scroll + highlight)
+# ==============================================================================
+class LyricsWindow(Toplevel):
+    """A standalone window that mirrors the current song's lyrics, auto-scrolls
+    and highlights the line being sung — so it stays readable even while the
+    full-screen visualizer covers the main Now-Playing panel.
+
+    It runs its own update loop off the app's playback clock, so it works
+    whether or not the overlay/visualizer is open."""
+
+    def __init__(self, app: "PlayerApp"):
+        super().__init__(app.root, bg=BG)
+        self.app = app
+        self.title("Lyrics — Cool MP3 Player")
+        self.geometry("520x680")
+        self.configure(bg=BG)
+        self.minsize(320, 320)
+
+        self._closed       = False
+        self._after_id     = None     # pending root.after id for the update loop
+        self._synced       = None     # [[t, line], ...] or None
+        self._synced_song  = None     # path the synced data belongs to
+        self._active_ln    = -1       # currently-highlighted line (1-based)
+        self._last_song    = None
+        self._font_size    = 16
+        self._line_px      = 0        # cached pixel height of one text line
+        # Manual-scroll override (same idea as the overlay): pause auto-scroll
+        # for a grace period after the user scrolls, then resume.
+        self._user_scroll_at = 0.0
+        self._resume_grace   = 4.0
+        # Live sync nudge: shift lyric timing earlier(+)/later(−) when the
+        # singer runs ahead of / behind the timings. Remembered per song.
+        self._sync_offset = 0.0
+        self._offsets     = {}        # path -> offset seconds
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _e: self.close())
+        # Stay on top by default so it can sit over the visualizer.
+        try: self.attributes("-topmost", True)
+        except Exception: pass
+        self._tick()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build(self):
+        hdr = Frame(self, bg="#0a0a0a", pady=10, padx=16); hdr.pack(fill=X)
+        self._title_var = StringVar(value="Nothing playing")
+        Label(hdr, textvariable=self._title_var, font=(FF, 13, "bold"),
+              bg="#0a0a0a", fg=TXT, anchor=W, wraplength=360).pack(side=LEFT)
+
+        Button(hdr, text="A−", font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID,
+               relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda: self._bump_font(-2)).pack(side=RIGHT, padx=(4, 0))
+        Button(hdr, text="A+", font=(FF, 10, "bold"), bg=BG3, fg=TXT_MID,
+               relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda: self._bump_font(2)).pack(side=RIGHT, padx=(4, 0))
+        self._top_btn = Button(hdr, text="📌", font=(FF, 10, "bold"),
+               bg=ACCENT, fg=WHITE, relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=ACCENT_DK, activeforeground=WHITE,
+               command=self._toggle_topmost)
+        self._top_btn.pack(side=RIGHT, padx=(4, 0))
+        self._topmost = True
+
+        Frame(self, bg=BORDER, height=1).pack(fill=X)
+
+        # Sync-nudge bar — shift the highlight earlier/later if it drifts off
+        # the singer (e.g. a song that's sung a little faster or slower than the
+        # lyric timings). Tap until the highlight lines up; it's kept per song.
+        sync = Frame(self, bg=BG2); sync.pack(fill=X)
+        Label(sync, text="Sync", font=(FF, 9, "bold"), bg=BG2,
+              fg=TXT_DIM).pack(side=LEFT, padx=(14, 6), pady=5)
+        Button(sync, text="◀ −", font=(FF, 9, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda: self._nudge_sync(-0.3)).pack(side=LEFT, padx=2)
+        self._sync_var = StringVar(value="on time")
+        Label(sync, textvariable=self._sync_var, font=(FF, 9), bg=BG2,
+              fg=TXT_MID, width=11).pack(side=LEFT, padx=2)
+        Button(sync, text="+ ▶", font=(FF, 9, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda: self._nudge_sync(0.3)).pack(side=LEFT, padx=2)
+        Button(sync, text="reset", font=(FF, 9), bg=BG4, fg=TXT_DIM,
+               relief=FLAT, cursor="hand2", padx=8, pady=2,
+               activebackground=BG3, activeforeground=TXT,
+               command=self._reset_sync).pack(side=LEFT, padx=(8, 0))
+        Label(sync, text="(or press  [  and  ]  )", font=(FF, 8), bg=BG2,
+              fg=TXT_DIM).pack(side=LEFT, padx=8)
+        self.bind("[", lambda _e: self._nudge_sync(-0.3))
+        self.bind("]", lambda _e: self._nudge_sync(0.3))
+
+        wrap = Frame(self, bg=BG); wrap.pack(fill=BOTH, expand=True)
+        sb = ttk.Scrollbar(wrap, orient=VERTICAL)
+        self._txt = Text(wrap, font=(FF, self._font_size), bg=BG, fg=TXT_MID,
+                         relief=FLAT, wrap=WORD, state=DISABLED,
+                         highlightthickness=0, padx=24, pady=20,
+                         spacing1=3, spacing3=3, yscrollcommand=sb.set)
+        sb.config(command=self._txt.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self._txt.pack(side=LEFT, fill=BOTH, expand=True)
+        # Karaoke styling: dim every line, light up the line being sung.
+        self._txt.tag_configure("dim", foreground=TXT_DIM)
+        self._txt.tag_configure("active", foreground=ACCENT_HI,
+                                font=(FF, self._font_size + 4, "bold"))
+        self._txt.tag_raise("active")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>",
+                    "<Up>", "<Down>", "<Prior>", "<Next>"):
+            self._txt.bind(seq, self._on_user_scroll, add="+")
+        sb.bind("<Button-1>",  self._on_user_scroll, add="+")
+        sb.bind("<B1-Motion>", self._on_user_scroll, add="+")
+
+    def _bump_font(self, d):
+        self._font_size = max(10, min(44, self._font_size + d))
+        self._txt.config(font=(FF, self._font_size))
+        self._txt.tag_configure("active", font=(FF, self._font_size + 4, "bold"))
+        self._line_px = 0   # force a re-measure for centering
+
+    def _toggle_topmost(self):
+        self._topmost = not self._topmost
+        try: self.attributes("-topmost", self._topmost)
+        except Exception: pass
+        self._top_btn.config(bg=ACCENT if self._topmost else BG3,
+                             fg=WHITE if self._topmost else TXT_MID)
+
+    def _on_user_scroll(self, _e=None):
+        self._user_scroll_at = time.time()
+        return None
+
+    # ── Live sync nudge ──────────────────────────────────────────────────────────
+    def _nudge_sync(self, d):
+        self._sync_offset = round(self._sync_offset + d, 1)
+        if self._last_song:
+            self._offsets[self._last_song.path] = self._sync_offset
+        self._active_ln = -1          # force the highlight to jump immediately
+        self._update_sync_label()
+        self._update_scroll()
+
+    def _reset_sync(self):
+        self._sync_offset = 0.0
+        if self._last_song:
+            self._offsets.pop(self._last_song.path, None)
+        self._active_ln = -1
+        self._update_sync_label()
+        self._update_scroll()
+
+    def _update_sync_label(self):
+        o = self._sync_offset
+        if   abs(o) < 0.05: txt = "on time"
+        elif o > 0:         txt = f"+{o:.1f}s ahead"
+        else:               txt = f"{o:.1f}s behind"
+        try: self._sync_var.set(txt)
+        except Exception: pass
+
+    # ── Content ─────────────────────────────────────────────────────────────────
+    def _current_song(self):
+        app = self.app
+        if app._queue and 0 <= app._q_idx < len(app._queue):
+            return app._queue[app._q_idx]
+        return None
+
+    def _set_text(self, text):
+        self._txt.config(state=NORMAL)
+        self._txt.tag_remove("active", "1.0", END)
+        self._txt.tag_remove("dim", "1.0", END)
+        self._txt.delete("1.0", END)
+        placeholder = ("No lyrics for this track yet.\n\n"
+                       "Open  Now Playing → Lyrics → 🔍 Generate  to fetch them.")
+        self._txt.insert("1.0", text if text else placeholder)
+        if text:
+            self._txt.tag_add("dim", "1.0", END)
+        self._txt.config(state=DISABLED)
+        self._active_ln = -1
+
+    def _load_song(self, song):
+        self._last_song = song
+        if not song:
+            self._title_var.set("Nothing playing")
+            self._synced = None; self._synced_song = None
+            self._set_text("")
+            return
+        self._title_var.set((song.title or song.name)[:70]
+                            + (f"  ·  {song.artist}" if song.artist else ""))
+        entry  = self.app.lyrics_db.get(song.path, {})
+        synced = entry.get("synced")
+        self._synced = ([[float(t), str(txt)] for t, txt in synced]
+                        if synced else None)
+        self._synced_song = song.path
+        if self._synced:
+            text = "\n".join(txt for _t, txt in self._synced)
+        else:
+            text = strip_lrc_tags(entry.get("lyrics", ""))
+        self._set_text(text)
+        # Reset the manual-scroll override and restore this song's sync nudge.
+        self._user_scroll_at = 0.0
+        self._sync_offset = self._offsets.get(song.path, 0.0)
+        self._update_sync_label()
+
+    def _visible_lines(self):
+        """How many text lines fit in the view right now (for centering)."""
+        try:
+            h = self._txt.winfo_height()
+            if self._line_px <= 0:
+                f = tkfont.Font(font=self._txt.cget("font"))
+                self._line_px = f.metrics("linespace") + 6   # + spacing1/3
+            return max(4, int(h / self._line_px))
+        except Exception:
+            return 12
+
+    def _scroll_to_line(self, ln):
+        """Keep the sung line ~a third from the top so upcoming lyrics show."""
+        try:
+            top_line = max(1, ln - max(1, self._visible_lines() // 3))
+            self._txt.yview(f"{top_line}.0")
+        except Exception:
+            pass
+
+    def _update_scroll(self):
+        app  = self.app
+        song = self._last_song
+        if not song or not app._playing or app._song_dur <= 0:
+            return
+        # Real position, plus the user's sync nudge, clamped into the song.
+        raw = time.time() - app._play_start
+        pos = max(0.0, min(raw + self._sync_offset, app._song_dur))
+        user_active = (time.time() - self._user_scroll_at) < self._resume_grace
+
+        if self._synced:
+            idx = -1
+            for i, (t, _txt) in enumerate(self._synced):
+                if t <= pos + 0.2: idx = i
+                else: break
+            if idx < 0:
+                return
+            ln = idx + 1
+        else:
+            cur = self._txt.get("1.0", "end-1c")
+            if not cur or "No lyrics" in cur:
+                return
+            lines = cur.split("\n")
+            n = len(lines)
+            idx = max(0, min(n - 1, int(pos / app._song_dur * n)))
+            if not lines[idx].strip():
+                fwd = next((j for j in range(idx, n) if lines[j].strip()), None)
+                bwd = next((j for j in range(idx, -1, -1) if lines[j].strip()), None)
+                idx = fwd if fwd is not None else (bwd if bwd is not None else idx)
+            ln = idx + 1
+
+        # Move the highlight tag only when the sung line actually changes.
+        if ln != self._active_ln:
+            self._active_ln = ln
+            try:
+                self._txt.tag_remove("active", "1.0", END)
+                self._txt.tag_add("active", f"{ln}.0", f"{ln}.end")
+            except Exception:
+                pass
+
+        # Re-assert the scroll position EVERY tick (unless the user is scrolling
+        # by hand). Doing it every tick — not just when the line changes — means
+        # a heavy visualizer redraw can never leave the view stranded: even if a
+        # scroll is dropped, the next tick (≈150ms) puts it right back.
+        if not user_active:
+            self._scroll_to_line(ln)
+
+        # Paint now so a saturated event loop (visualizer at ~30fps) can't delay
+        # the highlight/scroll from actually appearing.
+        try:
+            self._txt.update_idletasks()
+        except Exception:
+            pass
+
+    def _tick(self):
+        if self._closed:
+            return
+        # The whole body is guarded so a transient error can never break the
+        # update loop — the reschedule in `finally` keeps it alive. We drive it
+        # off the main root clock (like the overlay/visualizer) rather than the
+        # Toplevel's own, which is the reliable place to keep an after-loop.
+        try:
+            app  = self.app
+            song = self._current_song()
+            if song is not self._last_song:
+                self._load_song(song)
+            elif song:
+                # Lyrics / synced timings may arrive from a background lookup.
+                entry   = app.lyrics_db.get(song.path, {})
+                cur_txt = self._txt.get("1.0", "end-1c")
+                if (entry.get("lyrics") and "No lyrics" in cur_txt) or \
+                   (entry.get("synced") and self._synced is None
+                    and self._synced_song == song.path):
+                    self._load_song(song)
+            self._update_scroll()
+        except Exception:
+            pass
+        finally:
+            if not self._closed:
+                try:
+                    self._after_id = self.app.root.after(150, self._tick)
+                except Exception:
+                    pass
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._after_id is not None:
+            try: self.app.root.after_cancel(self._after_id)
+            except Exception: pass
+            self._after_id = None
+        if getattr(self.app, "_lyrics_window", None) is self:
+            self.app._lyrics_window = None
+        try: self.destroy()
+        except Exception: pass
+
+
+# ==============================================================================
 #  APPLICATION
 # ==============================================================================
 class PlayerApp:
@@ -2631,6 +3019,7 @@ class PlayerApp:
         self.playlists: list = []
         self.lyrics_db: dict = load_lyrics_db()
         self._overlay: "NowPlayingOverlay" = None
+        self._lyrics_window: "LyricsWindow" = None
         self._spectrum = AudioSpectrum()
 
         self._mq = queue.Queue()   # songs needing metadata (cover + lyrics)
@@ -3082,13 +3471,11 @@ class PlayerApp:
     #  PLAYLISTS TAB
     # ──────────────────────────────────────────────────────────────────────────
     def _build_playlists_tab(self, parent):
-        hdr = Frame(parent, bg=BG, pady=14); hdr.pack(fill=X, padx=28)
-        Label(hdr, text="Saved Playlists",
-              font=(FF, 14, "bold"), bg=BG, fg=TXT).pack(side=LEFT)
-        Button(hdr, text="＋  New Playlist", font=(FF, 10, "bold"),
-               bg=ACCENT, fg=WHITE, relief=FLAT, cursor="hand2", padx=14, pady=7,
-               activebackground=ACCENT_DK, activeforeground=WHITE,
-               command=self._new_playlist_dialog).pack(side=RIGHT)
+        # `_open_playlist` is None on the list view, or the playlist dict whose
+        # songs are currently being shown in the detail view.
+        self._open_playlist = None
+        # A header area that gets rebuilt for the list view vs. the detail view.
+        self._pls_hdr = Frame(parent, bg=BG); self._pls_hdr.pack(fill=X)
         Frame(parent, bg=BORDER, height=1).pack(fill=X)
         wrap = Frame(parent, bg=BG); wrap.pack(fill=BOTH, expand=True)
         self._pls_cv = Canvas(wrap, bg=BG, bd=0, highlightthickness=0)
@@ -3096,27 +3483,50 @@ class PlayerApp:
         self._pls_fr = Frame(self._pls_cv, bg=BG)
         self._pls_cv.configure(yscrollcommand=sb.set)
         sb.pack(side=RIGHT, fill=Y); self._pls_cv.pack(side=LEFT, fill=BOTH, expand=True)
-        win = self._pls_cv.create_window((0, 0), window=self._pls_fr, anchor=NW)
+        self._pls_win = self._pls_cv.create_window((0, 0), window=self._pls_fr, anchor=NW)
         self._pls_fr.bind("<Configure>",
                           lambda e: self._pls_cv.configure(
                               scrollregion=self._pls_cv.bbox("all")))
         self._pls_cv.bind("<Configure>",
-                          lambda e: self._pls_cv.itemconfig(win, width=e.width))
+                          lambda e: self._pls_cv.itemconfig(self._pls_win, width=e.width))
         self._scroll_canvases.add(self._pls_cv)
 
     def _render_playlists_tab(self):
+        # If the open playlist was deleted elsewhere, drop back to the list.
+        if self._open_playlist is not None and not any(
+                p["id"] == self._open_playlist["id"] for p in self.playlists):
+            self._open_playlist = None
+        for w in self._pls_hdr.winfo_children(): w.destroy()
         for w in self._pls_fr.winfo_children(): w.destroy()
+        if self._open_playlist is None:
+            self._render_playlists_list()
+        else:
+            self._render_playlist_detail(self._open_playlist)
+        self._pls_cv.update_idletasks()
+        self._pls_cv.configure(scrollregion=self._pls_cv.bbox("all"))
+
+    # ── List view: just the playlists, no songs ─────────────────────────────────
+    def _render_playlists_list(self):
+        inner = Frame(self._pls_hdr, bg=BG, pady=14); inner.pack(fill=X, padx=28)
+        Label(inner, text="Saved Playlists",
+              font=(FF, 14, "bold"), bg=BG, fg=TXT).pack(side=LEFT)
+        Button(inner, text="＋  New Playlist", font=(FF, 10, "bold"),
+               bg=ACCENT, fg=WHITE, relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=ACCENT_DK, activeforeground=WHITE,
+               command=self._new_playlist_dialog).pack(side=RIGHT)
+
         if not self.playlists:
             Label(self._pls_fr,
                   text="No saved playlists yet.\n"
-                       "Right-click a song in the Library → Add to Playlist.",
+                       "Right-click a song in the Library → Add to Playlist,\n"
+                       "or use  📁 Import Folder  to save a whole folder as a playlist.",
                   font=(FF, 11), bg=BG, fg=TXT_DIM,
                   justify=CENTER, pady=40).pack(); return
+
         for pl in reversed(self.playlists):
-            card = Frame(self._pls_fr, bg=BG3, pady=16, padx=20)
+            card = Frame(self._pls_fr, bg=BG3, pady=16, padx=20, cursor="hand2")
             card.pack(fill=X, pady=(0, 2))
-            top = Frame(card, bg=BG3); top.pack(fill=X)
-            bf  = Frame(top,  bg=BG3); bf.pack(side=RIGHT)
+            bf = Frame(card, bg=BG3); bf.pack(side=RIGHT)
             Button(bf, text="▶  Play", font=(FF, 10, "bold"),
                    bg=ACCENT, fg=WHITE, relief=FLAT, cursor="hand2",
                    padx=12, pady=6, activebackground=ACCENT_DK, activeforeground=WHITE,
@@ -3125,48 +3535,233 @@ class PlayerApp:
                    relief=FLAT, cursor="hand2", padx=10, pady=6,
                    activebackground="#200808", activeforeground="#EF5350",
                    command=lambda p=pl: self._delete_playlist(p)).pack(side=LEFT)
-            Label(top, text=pl["name"], font=(FF, 13, "bold"), bg=BG3, fg=TXT).pack(side=LEFT)
-            Label(card, text=f"{len(pl['songs'])} songs  ·  {pl['created']}",
-                  font=(FF, 9), bg=BG3, fg=TXT_DIM).pack(anchor=W, pady=(4, 10))
-            if not pl["songs"]:
-                Label(card, text="Empty playlist — right-click a song in the Library "
-                                 "→  Add to Playlist",
-                      font=(FF, 9), bg=BG3, fg=TXT_DIM, anchor=W).pack(anchor=W)
-            for i, s in enumerate(pl["songs"]):
-                row = Frame(card, bg=BG3); row.pack(fill=X, pady=2)
-                Label(row, text=str(i+1), font=(FF, 9), bg=BG3,
-                      fg=TXT_DIM, width=3, anchor=E).pack(side=LEFT)
-                Button(row, text="✕", font=(FF, 8), bg=BG3, fg="#EF5350",
-                       relief=FLAT, cursor="hand2", padx=4, pady=0,
-                       activebackground=BG3, activeforeground="#EF5350",
-                       command=lambda p=pl, idx=i: self._remove_from_playlist(p, idx)
-                       ).pack(side=RIGHT, padx=(4, 0))
-                Label(row, text=_fmt_dur(s.get("duration", 0)), font=(FF, 8),
-                      bg=BG3, fg=TXT_DIM).pack(side=RIGHT, padx=(4, 0))
-                Label(row, text=(s["name"][:48] + "…") if len(s["name"]) > 48 else s["name"],
-                      font=(FF, 10), bg=BG3, fg=TXT_MID).pack(side=LEFT, padx=8)
+            info = Frame(card, bg=BG3); info.pack(side=LEFT, fill=X, expand=True)
+            Label(info, text=pl["name"], font=(FF, 13, "bold"),
+                  bg=BG3, fg=TXT, anchor=W).pack(fill=X)
+            src = "  ·  from folder" if pl.get("source") == "folder" else ""
+            Label(info, text=f"{len(pl['songs'])} songs  ·  {pl['created']}{src}"
+                            f"      (click to open)",
+                  font=(FF, 9), bg=BG3, fg=TXT_DIM, anchor=W).pack(fill=X, pady=(4, 0))
+            # Click anywhere on the card (other than the buttons) opens it.
+            for w in (card, info, *info.winfo_children()):
+                w.bind("<Button-1>", lambda e, p=pl: self._open_playlist_view(p))
             Frame(self._pls_fr, bg=BORDER, height=1).pack(fill=X)
-        self._pls_cv.update_idletasks()
-        self._pls_cv.configure(scrollregion=self._pls_cv.bbox("all"))
 
-    def _play_saved_playlist(self, pl):
-        songs = []
-        for d in pl["songs"]:
-            if os.path.exists(d.get("path", "")):
-                s = Song.__new__(Song)
-                s.path = d["path"]; s.name = d["name"]
-                s.title = d["name"]; s.artist = d.get("artist", "")
-                s.duration = d.get("duration", 0.0)
-                s.busy = False; s.failed = False; s.cover_url = ""
-                songs.append(s)
+    # ── Detail view: the songs inside one playlist (like the Library) ────────────
+    def _render_playlist_detail(self, pl):
+        songs = self._playlist_songs(pl)
+        playable = sum(1 for s in songs if os.path.exists(s.path))
+
+        bar = Frame(self._pls_hdr, bg=BG, pady=12); bar.pack(fill=X, padx=20)
+        Button(bar, text="←  Playlists", font=(FF, 10, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=12, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=self._close_playlist_view).pack(side=LEFT, padx=(0, 12))
+        Label(bar, text=pl["name"], font=(FF, 14, "bold"),
+              bg=BG, fg=TXT).pack(side=LEFT)
+
+        self._pls_gen_btn = Button(bar, text="♪  Generate Lyrics", font=(FF, 10, "bold"),
+               bg=BG3, fg=TXT, relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda p=pl: self._generate_playlist_lyrics(p))
+        self._pls_gen_btn.pack(side=RIGHT, padx=(6, 0))
+        Button(bar, text="🔀  Shuffle All", font=(FF, 10, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda p=pl: self._shuffle_all_playlist(p)).pack(side=RIGHT, padx=(6, 0))
+        Button(bar, text="▶  Play All", font=(FF, 10, "bold"), bg=BG3, fg=TXT,
+               relief=FLAT, cursor="hand2", padx=14, pady=7,
+               activebackground=BG4, activeforeground=ACCENT,
+               command=lambda p=pl: self._play_all_playlist(p)).pack(side=RIGHT, padx=(6, 0))
+
+        meta = Frame(self._pls_hdr, bg=BG); meta.pack(fill=X, padx=28)
+        missing = len(songs) - playable
+        info_txt = f"{len(songs)} songs  ·  {pl['created']}"
+        if missing:
+            info_txt += f"  ·  {missing} not found on disk"
+        Label(meta, text=info_txt, font=(FF, 9),
+              bg=BG, fg=TXT_DIM).pack(side=LEFT, pady=(0, 8))
+
         if not songs:
-            messagebox.showwarning("Cool MP3 Player", "No files found on disk."); return
+            Label(self._pls_fr,
+                  text="This playlist is empty.\n"
+                       "Right-click a song in the Library → Add to Playlist.",
+                  font=(FF, 11), bg=BG, fg=TXT_DIM,
+                  justify=CENTER, pady=40).pack(); return
+        for i, s in enumerate(songs):
+            self._playlist_song_row(pl, i, s)
+
+    def _playlist_song_row(self, pl, idx, song):
+        row_bg  = BG4 if idx % 2 == 0 else BG3
+        missing = not os.path.exists(song.path)
+        row = Frame(self._pls_fr, bg=row_bg, pady=9); row.pack(fill=X)
+
+        play_btn = Button(row, text="▶", font=(FF, 11), bg=row_bg,
+                          fg=TXT_DIM if missing else ACCENT,
+                          relief=FLAT, cursor="hand2", padx=6, pady=2,
+                          activebackground=BG3, activeforeground=ACCENT,
+                          command=lambda i=idx: self._play_from_playlist(pl, i))
+        play_btn.pack(side=LEFT, padx=(8, 4))
+        Label(row, text=f"{idx+1:03d}", font=(FF, 9), bg=row_bg,
+              fg=TXT_DIM, width=4, anchor=E).pack(side=LEFT, padx=(0, 8))
+        Button(row, text="✕", font=(FF, 9), bg=row_bg, fg=TXT_DIM,
+               relief=FLAT, cursor="hand2", padx=5, pady=2,
+               activebackground="#200808", activeforeground="#EF5350",
+               command=lambda i=idx: self._remove_from_playlist(pl, i)).pack(side=RIGHT, padx=(0, 8))
+        if song.duration > 0:
+            Label(row, text=_fmt_dur(song.duration), font=(FF, 9),
+                  bg=row_bg, fg=TXT_DIM).pack(side=RIGHT, padx=(4, 6))
+        if song.path in self.lyrics_db and self.lyrics_db[song.path].get("lyrics"):
+            Label(row, text="♪", font=(FF, 9), bg=row_bg, fg=ACCENT).pack(side=RIGHT, padx=(0, 2))
+        if missing:
+            Label(row, text="missing", font=(FF, 8), bg=row_bg,
+                  fg="#EF5350").pack(side=RIGHT, padx=(0, 6))
+
+        info = Frame(row, bg=row_bg); info.pack(side=LEFT, fill=X, expand=True)
+        disp = song.title or song.name
+        name_str = (disp[:48] + "…") if len(disp) > 48 else disp
+        Label(info, text=name_str, font=(FF, 11), bg=row_bg,
+              fg=TXT_DIM if missing else TXT, anchor=W).pack(fill=X)
+        if song.artist:
+            Label(info, text=song.artist, font=(FF, 8), bg=row_bg,
+                  fg=TXT_DIM, anchor=W).pack(fill=X)
+        for w in (row, info):
+            w.bind("<Double-Button-1>", lambda e, i=idx: self._play_from_playlist(pl, i))
+
+    def _open_playlist_view(self, pl):
+        self._open_playlist = pl
+        self._render_playlists_tab()
+        self._pls_cv.yview_moveto(0)
+
+    def _close_playlist_view(self):
+        self._open_playlist = None
+        self._render_playlists_tab()
+        self._pls_cv.yview_moveto(0)
+
+    # ── Reconstruct playable Song objects from stored playlist entries ───────────
+    def _song_from_entry(self, d):
+        s = Song.__new__(Song)
+        s.path     = d.get("path", "")
+        s.name     = d.get("name") or Path(s.path).stem
+        s.title    = d.get("name") or s.name
+        s.artist   = d.get("artist", "")
+        s.duration = d.get("duration", 0.0)
+        s.busy     = False; s.failed = False; s.cover_url = ""
+        return s
+
+    def _playlist_songs(self, pl):
+        return [self._song_from_entry(d) for d in pl.get("songs", [])]
+
+    def _no_pygame_warn(self):
+        messagebox.showinfo("Cool MP3 Player",
+            "Install pygame-ce for playback:\n\n    pip install pygame-ce")
+
+    # ── Playlist playback ───────────────────────────────────────────────────────
+    def _play_saved_playlist(self, pl):
+        if not _PYGAME: self._no_pygame_warn(); return
+        songs = [s for s in self._playlist_songs(pl) if os.path.exists(s.path)]
+        if not songs:
+            messagebox.showwarning("Cool MP3 Player",
+                "None of this playlist's files were found on disk."); return
+        self._next_up.clear()
+        self._shuf_on = False; self._update_shuf_btn()
         self._play_playlist(songs, 0)
-        self._status.set(f"▶ Playing: {pl['name']}")
+        self._status.set(f"▶ Playing: {pl['name']}  ({len(songs)} songs)")
+
+    def _play_from_playlist(self, pl, idx):
+        """Play from the clicked song to the end of the playlist, then continue
+        through the earlier songs (shuffled) — a queue built only from this
+        playlist's songs, just like clicking a song in the Library."""
+        if not _PYGAME: self._no_pygame_warn(); return
+        songs = self._playlist_songs(pl)
+        if not songs or idx < 0 or idx >= len(songs): return
+        seed = songs[idx]
+        if not os.path.exists(seed.path):
+            self._status.set(f"File not found: {seed.title or seed.name}"); return
+        head = songs[idx:]
+        tail = songs[:idx]
+        random.shuffle(tail)
+        self._next_up.clear()
+        self._play_playlist(head + tail, 0)
+        self._status.set(f"▶ Playing: {seed.title or seed.name}  ·  from '{pl['name']}'"
+                         + (f"  ·  +{len(tail)} more queued" if tail else ""))
+
+    def _play_all_playlist(self, pl):
+        if not _PYGAME: self._no_pygame_warn(); return
+        songs = [s for s in self._playlist_songs(pl) if os.path.exists(s.path)]
+        if not songs:
+            self._status.set("No playable songs in this playlist"); return
+        self._next_up.clear()
+        self._shuf_on = False; self._update_shuf_btn()
+        self._play_playlist(songs, 0)
+        self._status.set(f"▶ Playing all {len(songs)} songs from '{pl['name']}'")
+
+    def _shuffle_all_playlist(self, pl):
+        if not _PYGAME: self._no_pygame_warn(); return
+        songs = [s for s in self._playlist_songs(pl) if os.path.exists(s.path)]
+        if not songs:
+            self._status.set("No playable songs in this playlist"); return
+        random.shuffle(songs)
+        self._next_up.clear()
+        self._shuf_on = True; self._update_shuf_btn()
+        self._play_playlist(songs, 0)
+        self._status.set(f"🔀 Shuffling all {len(songs)} songs from '{pl['name']}'")
+
+    # ── Bulk lyrics for a single playlist ───────────────────────────────────────
+    def _generate_playlist_lyrics(self, pl):
+        if getattr(self, "_lyrics_all_running", False):
+            self._status.set("Already generating lyrics — please wait…"); return
+        songs = self._playlist_songs(pl)
+        todo = [s for s in songs if os.path.exists(s.path) and
+                (s.path not in self.lyrics_db or
+                 not self.lyrics_db[s.path].get("lyrics"))]
+        if not todo:
+            self._status.set("Every song in this playlist already has lyrics  ♪"); return
+        if not messagebox.askyesno(
+                "Generate Lyrics for Playlist",
+                f"Look up lyrics for {len(todo)} song(s) in '{pl['name']}' "
+                f"that don't have them yet?\n\n"
+                f"This fetches from the internet and may take a little while."):
+            return
+        self._lyrics_all_running = True
+        try: self._pls_gen_btn.config(state=DISABLED, text="♪  Generating…")
+        except Exception: pass
+        threading.Thread(target=self._generate_playlist_lyrics_bg,
+                         args=(todo, pl["id"]), daemon=True).start()
+
+    def _generate_playlist_lyrics_bg(self, todo, pid):
+        found, total = 0, len(todo)
+        for i, song in enumerate(todo, 1):
+            if (song.path in self.lyrics_db and
+                    self.lyrics_db[song.path].get("lyrics")):
+                continue
+            self.root.after(0, lambda i=i, s=song: self._status.set(
+                f"♪ Generating lyrics {i}/{total}: {s.title or s.name}…"))
+            res = fetch_lyrics_full(song.title or song.name, song.artist)
+            if res["plain"]:
+                self._store_lyrics(song, res["plain"], res.get("synced"),
+                                   res.get("source") or "auto")
+                found += 1
+            time.sleep(0.4)   # be polite to the free lyrics APIs
+        self.root.after(0, lambda: self._generate_playlist_lyrics_done(found, total, pid))
+
+    def _generate_playlist_lyrics_done(self, found, total, pid):
+        self._lyrics_all_running = False
+        self._status.set(f"♪ Lyrics found for {found} of {total} song(s)")
+        save_library(self.songs)
+        # Refresh the detail view (to show the new ♪ markers) if still open.
+        if (self._active_tab == "Playlists" and self._open_playlist is not None
+                and self._open_playlist["id"] == pid):
+            self._render_playlists_tab()
+        else:
+            try: self._pls_gen_btn.config(state=NORMAL, text="♪  Generate Lyrics")
+            except Exception: pass
 
     def _delete_playlist(self, pl):
         if messagebox.askyesno("Delete", f"Delete \"{pl['name']}\"?"):
             self.playlists = [p for p in self.playlists if p["id"] != pl["id"]]
+            if self._open_playlist is not None and self._open_playlist["id"] == pl["id"]:
+                self._open_playlist = None
             save_playlists(self.playlists); self._render_playlists_tab()
 
     def _new_playlist_dialog(self):
@@ -3270,6 +3865,10 @@ class PlayerApp:
         Button(bar, text="⤢", font=(FF, 13), bg=BG4, fg=TXT_MID, relief=FLAT,
                cursor="hand2", padx=8, activebackground=BG3, activeforeground=TXT,
                command=self._toggle_now_playing).pack(side=RIGHT, padx=(0, 12))
+        # Pop the lyrics out into their own auto-scrolling karaoke window
+        Button(bar, text="⧉ Lyrics", font=(FF, 10), bg=BG4, fg=TXT_MID, relief=FLAT,
+               cursor="hand2", padx=8, activebackground=BG3, activeforeground=ACCENT,
+               command=self._toggle_lyrics_window).pack(side=RIGHT, padx=(0, 6))
 
         vol_f = Frame(bar, bg=BG4); vol_f.pack(side=RIGHT, padx=10, pady=10)
         Label(vol_f, text="🔊", font=(FF, 11), bg=BG4, fg=TXT_DIM).pack(side=LEFT)
@@ -3289,11 +3888,24 @@ class PlayerApp:
         elif self._overlay:
             self._overlay.show()
 
+    def _toggle_lyrics_window(self):
+        """Open (or focus) the standalone auto-scrolling lyrics window — handy
+        for following karaoke lyrics while the visualizer is up. Toggles closed
+        if it's already open."""
+        win = self._lyrics_window
+        if win is not None and not getattr(win, "_closed", True):
+            try:
+                if win.winfo_exists():
+                    win.close(); return
+            except Exception:
+                pass
+        self._lyrics_window = LyricsWindow(self)
+
     # ── Playback ───────────────────────────────────────────────────────────────
     def _play_playlist(self, songs, start_idx=0):
         self._queue = songs; self._q_idx = start_idx; self._play_current()
 
-    def _play_current(self):
+    def _play_current(self, _tries=0):
         if not _PYGAME or not self._queue: return
         if self._q_idx < 0 or self._q_idx >= len(self._queue): return
         song = self._queue[self._q_idx]
@@ -3322,7 +3934,17 @@ class PlayerApp:
             # Make sure metadata (cover + lyrics) gets looked up for played files
             self._mq.put(song)
         except Exception as ex:
-            self._status.set(f"Playback error: {ex}")
+            # A file may be missing, corrupt, or a non-audio sidecar. Don't
+            # dead-end — mark it failed and roll on to the next playable track.
+            song.failed = True
+            if _tries < len(self._queue) - 1:
+                self._status.set(f"Skipping unplayable file: {song.title or song.name}")
+                self._q_idx = (self._q_idx + 1) % len(self._queue)
+                self._play_current(_tries + 1)
+            else:
+                self._playing = False
+                self._play_btn.config(text="▶")
+                self._status.set(f"Couldn't play any tracks: {ex}")
 
     def _toggle_play(self):
         if not _PYGAME: return
